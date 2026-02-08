@@ -100,7 +100,9 @@ Below are a few photos from my own Wall Connector setup after wiring the ESP32/R
 
 ### Home Assistant view
 
-<img src="HA%20controls.png" alt="Home Assistant entities / controls" width="80%">
+<p align="center">
+  <img src="HA%20controls.png" alt="Home Assistant entities / controls" width="35%">
+</p>
 
 ### Wall Connector configuration
 
