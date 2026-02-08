@@ -98,6 +98,10 @@ Note: the YAML also defines three internal GPIO switches to power/enable RS485 h
 
 Below are a few photos from my own Wall Connector setup after wiring the ESP32/RS485 and using this configuration.
 
+### Home Assistant view
+
+<img src="HA%20controls.png" alt="Home Assistant entities / controls" width="80%">
+
 ### Wall Connector configuration
 
 <table>
