@@ -1,0 +1,1266 @@
+# ==============================================================================
+# Tesla Wall Connector Gen 3 - Dynamic Power Limiter (Neurio Emulation)
+# ==============================================================================
+# ⚠️ REQUIRED USER CONFIGURATION (Home Assistant entities)
+# ------------------------------------------------------------------------------
+# You MUST set Home Assistant sensor entity_ids for the number of phases
+# you have selected under "Grid Phase Count".
+#
+# These sensors MUST report CURRENT PER PHASE IN AMPERES (A).
+#
+# Examples:
+#   sensor.p1_l1_current
+#   sensor.energy_meter_ct1_amps
+#   sensor.house_phase1_current
+#
+# ❌ Do NOT use power (W / kW)
+# ❌ Do NOT use energy (kWh)
+# ❌ Do NOT use total house current (must be per-phase)
+#
+# Phase requirements:
+#   - 1 phase: only Phase 1 sensor is required
+#   - 2 phases: Phase 1 + Phase 2 sensors are required
+#   - 3 phases: Phase 1 + Phase 2 + Phase 3 sensors are required
+#
+# ------------------------------------------------------------------------------
+# House load sensors (per phase, in AMPERES):
+#   - Phase 1: sensor.YOUR_PHASE1_SENSOR   (required for all setups)
+#   - Phase 2: sensor.YOUR_PHASE2_SENSOR   (required for 2- and 3-phase)
+#   - Phase 3: sensor.YOUR_PHASE3_SENSOR   (required for 3-phase)
+# ==============================================================================
+
+substitutions:
+  device_name: tesla-wall-connector-control        # ESPHome device name (used for hostname and entity IDs)
+  friendly_name: "Tesla Wall Connector Control"    # Friendly name shown in Home Assistant UI
+  tx_pin: GPIO22                                   # RS485 TX pin on your ESP32 (connect to RS485 DI)
+  rx_pin: GPIO21                                   # RS485 RX pin on your ESP32 (connect to RS485 RO)
+  watchdog_fault_delay_ms: "8000"                  # Time before watchdog triggers fallback after a fault is detected
+  watchdog_recover_delay_ms: "30000"               # Time with healthy data before watchdog releases control
+  watchdog_freeze_timeout_ms: "20000"              # Time without sensor value changes before freeze is assumed
+  watchdog_api_timeout_ms: "15000"                 # Time without HA updates before API disconnect is assumed
+  watchdog_boot_grace_ms: "60000"                  # Grace period after boot before watchdog is allowed to act
+  
+  # --- USER MUST SET THESE ---
+  house_phase1_entity: sensor.current_phase_1_2    # Phase 1 current sensor in Home Assistant (required for all setups)
+  house_phase2_entity: sensor.current_phase_2_2    # Phase 2 current sensor (ignored if 1-phase, do not remove)
+  house_phase3_entity: sensor.current_phase_3_2    # Phase 3 current sensor (ignored if 1- or 2-phase, do not remove)
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: 600.0
+    then:
+      # Power the RS485 hardware rails
+      - switch.turn_on: sw_enable_5v_rs485
+      - switch.turn_on: sw_enable_rs485
+      - switch.turn_on: sw_rs485_auto_dir
+
+      # Allow RS485 hardware to stabilize
+      - delay: 500ms
+
+      # Apply log level selected in Home Assistant
+      - lambda: |-
+          auto lvl_ref = id(ha_log_level).current_option();
+          std::string lvl = lvl_ref.empty() ? "INFO" : std::string(lvl_ref.c_str());
+
+          int level = ESPHOME_LOG_LEVEL_INFO;
+          if (lvl == "ERROR") level = ESPHOME_LOG_LEVEL_ERROR;
+          else if (lvl == "WARN") level = ESPHOME_LOG_LEVEL_WARN;
+          else if (lvl == "INFO") level = ESPHOME_LOG_LEVEL_INFO;
+          else if (lvl == "DEBUG") level = ESPHOME_LOG_LEVEL_DEBUG;
+          else if (lvl == "VERBOSE") level = ESPHOME_LOG_LEVEL_VERBOSE;
+
+          id(main_logger).set_log_level(level);
+
+      # Store boot timestamp for watchdog grace period
+      - lambda: |-
+          id(watchdog_boot_ms) = millis();
+
+      # Wait for Home Assistant to restore entity states
+      - delay: 2s
+
+      # Mark system as ready after HA sync
+      - globals.set:
+          id: boot_ready
+          value: 'true'
+
+      # Restore manual charge current if Auto mode is disabled
+      - lambda: |-
+          if (!id(auto_load_control).state) {
+            float restored = id(ha_set_current).state;
+
+            if (!isnan(restored)) {
+              id(target_current_a) = restored;
+              id(target_current_internal_a) = roundf(restored) - 0.01f;
+              ESP_LOGI("tesla", "Restored manual target from HA: %.1fA", restored);
+              id(calc_registers).execute();
+            } else {
+              ESP_LOGW("tesla", "HA manual target not available yet");
+            }
+          }
+
+esp32:
+  # ESP32 board definition
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  id: main_logger
+  # Default log level (can be overridden from Home Assistant)
+  level: VERBOSE 
+  # Disable serial logging to free UART for RS485
+  baud_rate: 0
+
+api:
+  encryption:
+    # Use !secret api_key or replace with hardcoded string
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    # Use !secret ota_pw or replace with hardcoded string
+    password: !secret ota_pw
+
+wifi:
+  # Use !secret wifi_ssid and wifi_password or replace with hardcoded values
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback AP when WiFi cannot connect
+  ap:
+    ssid: "${friendly_name}"
+    # Use !secret fallback_password or replace with hardcoded string
+    password: !secret fallback_password
+
+# Enables captive portal for fallback AP
+captive_portal:
+
+web_server:
+  # Local web UI for diagnostics and debugging
+  port: 80
+  version: 3
+
+switch:
+  # Enables 5V supply for RS485 board
+  - platform: gpio
+    id: sw_enable_5v_rs485
+    name: "Hardware: RS485 5V"
+    pin:
+      number: GPIO16
+      inverted: false
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  # Enables RS485 transceiver power
+  - platform: gpio
+    id: sw_enable_rs485
+    name: "Hardware: RS485 Transceiver"
+    pin:
+      number: GPIO19
+      inverted: false
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  # Enables RS485 automatic direction control
+  - platform: gpio
+    id: sw_rs485_auto_dir
+    name: "Hardware: RS485 Auto Dir"
+    pin:
+      number: GPIO17
+      inverted: false
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  # Enables or disables automatic status LED behavior
+  - platform: template
+    id: switch_auto_led_mode
+    name: "Auto Status LED"
+    icon: "mdi:eye-refresh"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+
+  # Main control switch for dynamic load balancing
+  - platform: template
+    id: auto_load_control
+    name: "Tesla Wall Connector Auto Mode"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: false
+
+    # Validate sensor availability before allowing Auto mode
+    turn_on_action:
+      - lambda: |-
+          auto opt = id(ha_phase_count).current_option();
+          int phases = opt.empty() ? 3 : atoi(opt.c_str());
+
+          bool ok = !isnan(id(ha_house_l1).state);
+          if (phases >= 2) ok = ok && !isnan(id(ha_house_l2).state);
+          if (phases >= 3) ok = ok && !isnan(id(ha_house_l3).state);
+
+          if (!ok) {
+            id(auto_load_control).publish_state(false);
+            id(auto_was_active) = false;
+            ESP_LOGW("tesla",
+              "Auto mode blocked: L1=%s L2=%s L3=%s",
+              isnan(id(ha_house_l1).state) ? "MISSING" : "OK",
+              isnan(id(ha_house_l2).state) ? "MISSING" : "OK",
+              isnan(id(ha_house_l3).state) ? "MISSING" : "OK"
+            );
+          } else {
+            id(auto_load_control).publish_state(true);
+            id(auto_was_active) = true;
+            ESP_LOGI("tesla", "Auto mode enabled");
+            id(calc_registers).execute();
+          }
+
+    # Disable Auto mode and recompute registers
+    turn_off_action:
+      - lambda: |-
+          id(auto_load_control).publish_state(false);
+          id(auto_was_active) = false;
+          id(calc_registers).execute();
+
+  # Enables or disables watchdog safety logic
+  - platform: template
+    id: watchdog_enable
+    name: "Tesla Watchdog Enable"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    entity_category: "config"
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    name: "Manual Control Status LED"
+    # GPIO pin connected to the WS2812 LED
+    pin: GPIO4
+    num_leds: 1
+    rgb_order: GRB
+    chipset: ws2812
+    restore_mode: ALWAYS_OFF
+    # Disable fade transitions
+    default_transition_length: 0s
+    # When LED is turned on manually, disable auto LED mode
+    on_turn_on:
+      - if:
+          condition:
+            lambda: return !id(led_is_internal_g);
+          then:
+            - switch.turn_off: switch_auto_led_mode
+    # When LED is turned off manually, disable auto LED mode
+    on_turn_off:
+      - if:
+          condition:
+            lambda: return !id(led_is_internal_g);
+          then:
+            - switch.turn_off: switch_auto_led_mode
+
+uart:
+  - id: wallconn_uart
+    # RS485 TX pin
+    tx_pin: ${tx_pin}
+    # RS485 RX pin
+    rx_pin: ${rx_pin}
+    # Baud rate used by Tesla Wall Connector protocol
+    baud_rate: 115200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+
+modbus:
+  - id: wallconn_modbus
+    # Bind Modbus to RS485 UART
+    uart_id: wallconn_uart
+    # Act as Modbus server (Tesla reads from this device)
+    role: server
+    # Delay between Modbus frames
+    send_wait_time: 200ms
+
+globals:
+  # Flag to mark internal LED updates (prevents feedback loop)
+  - id: led_is_internal_g
+    type: bool
+    initial_value: 'false'
+  # Grid voltage used for power calculations
+  - id: grid_voltage_v
+    type: float
+    initial_value: "230.0"
+  # Manual target current set by user (restored after reboot)
+  - id: target_current_a
+    type: float
+    restore_value: true
+  # Simulated Phase 1 current sent to Tesla
+  - id: ct1_current_a
+    type: float
+    initial_value: "0.0"
+  # Simulated Phase 2 current sent to Tesla
+  - id: ct2_current_a
+    type: float
+    initial_value: "0.0"
+  # Simulated Phase 3 current sent to Tesla
+  - id: ct3_current_a
+    type: float
+    initial_value: "0.0"
+  # Total simulated current sent to Tesla
+  - id: ct_total_a
+    type: float
+    initial_value: "0.0"
+  # Simulated Phase 1 power sent to Tesla
+  - id: ct1_power_w
+    type: float
+    initial_value: "0.0"
+  # Simulated Phase 2 power sent to Tesla
+  - id: ct2_power_w
+    type: float
+    initial_value: "0.0"
+  # Simulated Phase 3 power sent to Tesla
+  - id: ct3_power_w
+    type: float
+    initial_value: "0.0"
+  # Total simulated power sent to Tesla
+  - id: ct_total_w
+    type: float
+    initial_value: "0.0"
+
+  # Timestamp of last Modbus poll from Tesla
+  - id: modbus_last_poll_ms
+    type: uint32_t
+    initial_value: "0"
+  # Final current setpoint actually sent to Tesla (rounded workaround)
+  - id: target_current_internal_a
+    type: float
+  # Tracks if Auto mode was previously active
+  - id: auto_was_active
+    type: bool
+    initial_value: "false"
+  # Prevents logic from running before boot sequence is finished
+  - id: boot_ready
+    type: bool
+    initial_value: "false"
+  # True when watchdog has taken control
+  - id: watchdog_active
+    type: bool
+    initial_value: "false"
+  # True when watchdog forces charging pause
+  - id: watchdog_forced_pause
+    type: bool
+    initial_value: "false"
+
+  # Timestamp of last watchdog fault detection
+  - id: watchdog_last_fault_ms
+    type: uint32_t
+    initial_value: "0"
+  # Timestamp of last stable healthy watchdog state
+  - id: watchdog_last_ok_ms
+    type: uint32_t
+    initial_value: "0"
+  # Human-readable watchdog reason shown in Home Assistant
+  - id: watchdog_reason
+    type: std::string
+    initial_value: '"-"'
+  # Last Phase 1 value (used for freeze detection)
+  - id: wd_last_l1
+    type: float
+    initial_value: "NAN"
+  # Last Phase 2 value (used for freeze detection)
+  - id: wd_last_l2
+    type: float
+    initial_value: "NAN"
+  # Last Phase 3 value (used for freeze detection)
+  - id: wd_last_l3
+    type: float
+    initial_value: "NAN"
+  # Timestamp of last phase change (freeze detection timer)
+  - id: wd_last_change_ms
+    type: uint32_t
+    initial_value: "0"
+  # Timestamp of last Home Assistant sensor update (API timeout detection)
+  - id: watchdog_last_ha_update_ms
+    type: uint32_t
+    initial_value: "0"
+  # Boot timestamp used for watchdog grace period
+  - id: watchdog_boot_ms
+    type: uint32_t
+    initial_value: "0"
+
+select:
+  # Log level selector for ESPHome runtime logging
+  - platform: template
+    id: ha_log_level
+    name: "ESPHome Log Level"
+    icon: "mdi:console-line"
+    options: ["ERROR", "WARN", "INFO", "DEBUG", "VERBOSE"]
+    initial_option: "DEBUG"
+    restore_value: true
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - lambda: |-
+            int level = ESPHOME_LOG_LEVEL_INFO;
+            if (x == "ERROR") level = ESPHOME_LOG_LEVEL_ERROR;
+            else if (x == "WARN") level = ESPHOME_LOG_LEVEL_WARN;
+            else if (x == "INFO") level = ESPHOME_LOG_LEVEL_INFO;
+            else if (x == "DEBUG") level = ESPHOME_LOG_LEVEL_DEBUG;
+            else if (x == "VERBOSE") level = ESPHOME_LOG_LEVEL_VERBOSE;
+            id(main_logger).set_log_level(level);
+
+  # Grid voltage selector used for power calculations
+  - platform: template
+    id: grid_voltage_select
+    name: "Grid Voltage"
+    optimistic: true
+    options: ["230V", "110V"]
+    initial_option: "230V"
+    entity_category: "config"
+    on_value:
+      then:
+        - lambda: |-
+            float v = (x == "110V") ? 110.0f : 230.0f;
+            id(grid_voltage_v) = v;
+            ESP_LOGI("tesla", "Grid voltage set to %.0fV", v);
+        - script.execute: calc_registers
+
+  # Number of grid phases used for load calculations
+  - platform: template
+    id: ha_phase_count
+    name: "Grid Phase Count"
+    icon: "mdi:sine-wave"
+    options: ["1", "2", "3"]
+    initial_option: "3"
+    restore_value: true
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGI("tesla", "Grid phase count changed to %s", x.c_str());
+        - script.execute: calc_registers
+
+number:
+  # Main fuse rating of the house (used as absolute limit)
+  - platform: template
+    id: ha_main_fuse
+    name: "House Main Fuse"
+    unit_of_measurement: "A"
+    min_value: 6
+    max_value: 200
+    step: 1
+    restore_value: true
+    initial_value: 16
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - script.execute: calc_registers
+
+  # Manual charging current setpoint (used when Auto mode is off)
+  - platform: template
+    id: ha_set_current
+    name: "Manual Target Setpoint"
+    unit_of_measurement: "A"
+    min_value: 6
+    max_value: 48
+    step: 1
+    restore_value: true
+    optimistic: false
+    set_action:
+      - lambda: |-
+          float wc_max = id(ha_wc_max_current).state;
+          float v = x;
+
+          if (v > wc_max) {
+            id(ha_set_current).publish_state(wc_max);
+            id(target_current_a) = wc_max;
+          } else {
+            id(target_current_a) = v;
+          }
+
+          if (id(boot_ready)) {
+            id(calc_registers).execute();
+          }
+
+  # Maximum current supported by the Wall Connector hardware
+  - platform: template
+    id: ha_wc_max_current
+    name: "Wall Connector Max Current"
+    unit_of_measurement: "A"
+    min_value: 6
+    max_value: 48
+    step: 1
+    restore_value: true
+    initial_value: 32
+    optimistic: true
+    entity_category: "config"
+    on_value:
+      then:
+        - script.execute: calc_registers
+
+  # Watchdog fallback current used when safety triggers
+  - platform: template
+    id: watchdog_fallback_current
+    name: "Tesla Watchdog Fallback Current"
+    unit_of_measurement: "A"
+    min_value: 6
+    max_value: 48
+    step: 1
+    restore_value: true
+    initial_value: 6
+    optimistic: true
+    entity_category: "config"
+
+
+button:
+  # Restart ESP device from Home Assistant
+  - platform: restart
+    name: "${friendly_name} Restart"
+
+sensor:
+  # Device uptime
+  - platform: uptime
+    id: uptime_sensor
+    name: "Uptime"
+
+  # WiFi signal strength
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  # Final current value actually sent to Tesla (rounded workaround)
+  - platform: template
+    name: "Tesla Wall Connector Effective Setpoint"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      return id(target_current_internal_a);
+
+  # Phase 1 house load (from Home Assistant sensor)
+  - platform: template
+    name: "House Load Phase 1"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    lambda: |-
+      return id(ha_house_l1).state;
+
+  # Phase 2 house load (from Home Assistant sensor)
+  - platform: template
+    name: "House Load Phase 2"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    lambda: |-
+      return id(ha_house_l2).state;
+
+  # Phase 3 house load (from Home Assistant sensor)
+  - platform: template
+    name: "House Load Phase 3"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    lambda: |-
+      return id(ha_house_l3).state;
+
+  # Home Assistant Phase 1 sensor (used by Auto mode and Watchdog)
+  - platform: homeassistant
+    id: ha_house_l1
+    entity_id: ${house_phase1_entity}
+    on_value:
+      then:
+        - lambda: |-
+            id(watchdog_last_ha_update_ms) = millis();
+            if (id(auto_load_control).state && !id(watchdog_active)) {
+              id(calc_registers).execute();
+            }
+
+  # Home Assistant Phase 2 sensor
+  - platform: homeassistant
+    id: ha_house_l2
+    entity_id: ${house_phase2_entity}
+    on_value:
+      then:
+        - lambda: |-
+            id(watchdog_last_ha_update_ms) = millis();
+            if (id(auto_load_control).state && !id(watchdog_active)) {
+              id(calc_registers).execute();
+            }
+
+  # Home Assistant Phase 3 sensor
+  - platform: homeassistant
+    id: ha_house_l3
+    entity_id: ${house_phase3_entity}
+    on_value:
+      then:
+        - lambda: |-
+            id(watchdog_last_ha_update_ms) = millis();
+            if (id(auto_load_control).state && !id(watchdog_active)) {
+              id(calc_registers).execute();
+            }
+
+  # Exposes Wall Connector max current as sensor for UI visibility
+  - platform: template
+    name: "Effective Max Charge Current"
+    unit_of_measurement: "A"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(ha_wc_max_current).state;
+    update_interval: 5s
+
+text_sensor:
+  # High-level status for Auto mode and sensor availability
+  - platform: template
+    name: "Tesla Auto Status"
+    lambda: |-
+      if (!id(auto_load_control).state && id(auto_was_active))
+        return std::string("Auto stopped, sensor lost");
+
+      if (!id(auto_load_control).state)
+        return std::string("Manual mode");
+
+      auto opt = id(ha_phase_count).current_option();
+      int phases = opt.empty() ? 3 : atoi(opt.c_str());
+
+      if (phases >= 1 && isnan(id(ha_house_l1).state))
+        return std::string("Missing Phase 1 sensor");
+
+      if (phases >= 2 && isnan(id(ha_house_l2).state))
+        return std::string("Missing Phase 2 sensor");
+
+      if (phases >= 3 && isnan(id(ha_house_l3).state))
+        return std::string("Missing Phase 3 sensor");
+
+      return std::string("Auto active");
+    update_interval: 2s
+
+  # Detailed sensor health status for house load sensors
+  - platform: template
+    name: "Tesla House Load Sensor Status"
+    lambda: |-
+      auto opt = id(ha_phase_count).current_option();
+      int phases = opt.empty() ? 3 : atoi(opt.c_str());
+
+      bool has_house_load = !isnan(id(ha_house_l1).state);
+      if (phases >= 2) has_house_load = has_house_load && !isnan(id(ha_house_l2).state);
+      if (phases >= 3) has_house_load = has_house_load && !isnan(id(ha_house_l3).state);
+
+      if (phases >= 1 && isnan(id(ha_house_l1).state))
+        return std::string("Missing Phase 1 sensor");
+
+      if (phases >= 2 && isnan(id(ha_house_l2).state))
+        return std::string("Missing Phase 2 sensor");
+
+      if (phases >= 3 && isnan(id(ha_house_l3).state))
+        return std::string("Missing Phase 3 sensor");
+
+      if (!id(auto_load_control).state && id(auto_was_active) && has_house_load)
+        return std::string("Sensors restored, ready to resume Auto");
+
+      return std::string("House load sensors OK");
+    update_interval: 5s
+
+  # Watchdog runtime status for HA visibility
+  - platform: template
+    id: watchdog_status
+    name: "Tesla Watchdog Status"
+    lambda: |-
+      if (!id(watchdog_enable).state)
+        return std::string("Disabled");
+
+      if (!id(auto_load_control).state)
+        return std::string("Idle (Manual mode)");
+
+      if (id(watchdog_active)) {
+        if (id(watchdog_forced_pause))
+          return std::string("Active: Charging paused");
+        return std::string("Active: ") + id(watchdog_reason);
+      }
+
+      return std::string("OK");
+    update_interval: 2s
+
+
+script:
+  # Calculates the allowed charging current and updates Modbus registers
+  - id: calc_registers
+    then:
+      - lambda: |-
+          // Prevent execution before boot is complete
+          if (!id(boot_ready)) {
+            ESP_LOGW("tesla", "Boot guard active, skipping register update");
+            return;
+          }
+
+          // Read house fuse and grid voltage
+          float fuse = id(ha_main_fuse).state;
+          float voltage = id(grid_voltage_v);
+
+          // Determine number of phases
+          auto opt = id(ha_phase_count).current_option();
+          int phases = opt.empty() ? 3 : atoi(opt.c_str());
+          if (phases < 1) phases = 1;
+          if (phases > 3) phases = 3;
+
+          // Read house load per phase
+          float l1 = id(ha_house_l1).state;
+          float l2 = id(ha_house_l2).state;
+          float l3 = id(ha_house_l3).state;
+
+          // Validate that required sensors are available (for selected phase count)
+          bool has_house_load = !isnan(l1);
+          if (phases >= 2) has_house_load = has_house_load && !isnan(l2);
+          if (phases >= 3) has_house_load = has_house_load && !isnan(l3);
+
+          // If watchdog is active, do NOT change target_current_internal_a here
+          bool watchdog = id(watchdog_active);
+          if (watchdog) {
+            ESP_LOGD("tesla", "Watchdog active, keeping current setpoint");
+          }
+
+          float worst_phase = NAN;
+
+          // Compute worst phase (only if sensors are valid)
+          if (has_house_load) {
+            worst_phase = l1;
+            if (phases >= 2 && l2 > worst_phase) worst_phase = l2;
+            if (phases >= 3 && l3 > worst_phase) worst_phase = l3;
+          }
+
+          // Only calculate new setpoint if watchdog is NOT in control
+          if (!watchdog) {
+
+            float wc_max = id(ha_wc_max_current).state;
+
+            // Small safety margin to reduce nuisance trips due to noise/transients.
+            // Adjust to 0.0f if you want maximum aggressiveness.
+            const float SAFETY_MARGIN_A = 1.0f;
+
+            // --------------------------
+            // AUTO MODE
+            // --------------------------
+            if (id(auto_load_control).state) {
+
+              // If sensors are missing while Auto is on, do NOT change setpoint.
+              // This avoids "guessing" and accidentally overloading.
+              if (!has_house_load) {
+                ESP_LOGW("tesla", "Auto mode but house load sensors missing, keeping last setpoint");
+              } else {
+
+                // Headroom on worst phase with margin
+                float headroom = fuse - worst_phase - SAFETY_MARGIN_A;
+                if (headroom < 0.0f) headroom = 0.0f;
+
+                // Also respect Wall Connector max
+                float available = headroom;
+                if (available > wc_max) available = wc_max;
+
+                // Choose the integer we want Tesla UI to show
+                float ui_amps = roundf(available);
+
+                // HARD SAFETY CLAMP:
+                // Never allow rounding up into an overload. Max allowed is floor(headroom).
+                float max_allowed = floorf(headroom);
+                if (max_allowed < 0.0f) max_allowed = 0.0f;
+                if (ui_amps > max_allowed) ui_amps = max_allowed;
+
+                // Final clamps
+                if (ui_amps < 0.0f) ui_amps = 0.0f;
+                if (ui_amps > wc_max) ui_amps = wc_max;
+
+                // Tesla rounding workaround:
+                // - If ui_amps == 0 -> send 0 exactly
+                // - Else -> send (ui_amps - 0.01) so UI shows ui_amps
+                if (ui_amps <= 0.0f) {
+                  id(target_current_internal_a) = 0.0f;
+                } else {
+                  id(target_current_internal_a) = ui_amps - 0.01f;
+                }
+              }
+
+            // --------------------------
+            // MANUAL MODE
+            // --------------------------
+            } else {
+
+              float manual = id(target_current_a);
+              if (isnan(manual)) {
+                ESP_LOGW("tesla", "Manual target not ready yet, skipping update");
+                return;
+              }
+
+              // Choose integer for UI display
+              float ui_amps = roundf(manual);
+
+              // Safety clamps
+              if (ui_amps < 0.0f) ui_amps = 0.0f;
+              if (ui_amps > wc_max) ui_amps = wc_max;
+              if (ui_amps > fuse) ui_amps = fuse;
+
+              if (ui_amps <= 0.0f) {
+                id(target_current_internal_a) = 0.0f;
+              } else {
+                id(target_current_internal_a) = ui_amps - 0.01f;
+              }
+            }
+          }
+
+          // --------------------------
+          // Update simulated Neurio values (always, even under watchdog)
+          // --------------------------
+
+          // Simulated Neurio load seen by Wall Connector
+          float fake_load = fuse - id(target_current_internal_a);
+          if (fake_load < 0.0f) fake_load = 0.0f;
+
+          // Publish simulated current per phase
+          id(ct1_current_a) = fake_load;
+          id(ct2_current_a) = (phases >= 2) ? fake_load : 0.0f;
+          id(ct3_current_a) = (phases >= 3) ? fake_load : 0.0f;
+          id(ct_total_a) = fake_load * phases;
+
+          // Publish simulated power per phase
+          id(ct1_power_w) = voltage * fake_load;
+          id(ct2_power_w) = (phases >= 2) ? voltage * fake_load : 0.0f;
+          id(ct3_power_w) = (phases >= 3) ? voltage * fake_load : 0.0f;
+          id(ct_total_w) = voltage * fake_load * phases;
+
+          // Debug output for calculation tracing
+          float headroom_dbg = NAN;
+          if (!isnan(worst_phase)) headroom_dbg = fuse - worst_phase;
+
+          ESP_LOGD("tesla-debug",
+            "Fuse=%.1f, L1=%.2f, L2=%.2f, L3=%.2f, Worst=%.2f, Headroom=%.2f, Setpoint=%.2f, Watchdog=%s",
+            fuse,
+            l1, l2, l3,
+            worst_phase,
+            headroom_dbg,
+            id(target_current_internal_a),
+            watchdog ? "YES" : "NO"
+          );
+
+          // Summary log for normal operation
+          if (id(auto_load_control).state) {
+            ESP_LOGD("tesla",
+              "Mode=AUTO%s, Setpoint=%.2fA, WorstPhase=%.2f",
+              watchdog ? " (WATCHDOG)" : "",
+              id(target_current_internal_a),
+              worst_phase
+            );
+          } else {
+            ESP_LOGI("tesla",
+              "Mode=MANUAL%s, Setpoint=%.2fA",
+              watchdog ? " (WATCHDOG)" : "",
+              id(target_current_internal_a)
+            );
+          }
+
+  # Watchdog that pauses or limits charging on sensor/API failure
+  - id: watchdog_check
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+
+          // Ignore watchdog during boot grace period
+          if (!id(boot_ready) || (now - id(watchdog_boot_ms)) < ${watchdog_boot_grace_ms}) {
+            return;
+          }
+
+          // Determine phase count
+          auto opt = id(ha_phase_count).current_option();
+          int phases = opt.empty() ? 3 : atoi(opt.c_str());
+          if (phases < 1) phases = 1;
+          if (phases > 3) phases = 3;
+
+          // Read house load sensors
+          float l1 = id(ha_house_l1).state;
+          float l2 = id(ha_house_l2).state;
+          float l3 = id(ha_house_l3).state;
+
+          // Initialize freeze detection baseline once we have L1
+          if (isnan(id(wd_last_l1)) && !isnan(l1)) {
+            id(wd_last_l1) = l1;
+            id(wd_last_l2) = l2;
+            id(wd_last_l3) = l3;
+            id(wd_last_change_ms) = now;
+            return;
+          }
+
+          // If watchdog disabled, reset state and exit
+          if (!id(watchdog_enable).state) {
+            id(watchdog_active) = false;
+            id(watchdog_forced_pause) = false;
+            id(watchdog_reason) = "-";
+            id(watchdog_last_fault_ms) = 0;
+            id(watchdog_last_ok_ms) = 0;
+            return;
+          }
+
+          // Watchdog only applies in Auto mode
+          if (!id(auto_load_control).state) {
+            id(watchdog_active) = false;
+            id(watchdog_forced_pause) = false;
+            id(watchdog_reason) = "-";
+            id(watchdog_last_fault_ms) = 0;
+            id(watchdog_last_ok_ms) = 0;
+            return;
+          }
+
+          // Check sensor availability for selected phase count
+          bool sensors_ok = !isnan(l1);
+          if (phases >= 2) sensors_ok = sensors_ok && !isnan(l2);
+          if (phases >= 3) sensors_ok = sensors_ok && !isnan(l3);
+
+          // Detect HA API timeout (no updates recently)
+          bool api_stale =
+            (id(watchdog_last_ha_update_ms) > 0) &&
+            ((now - id(watchdog_last_ha_update_ms)) > ${watchdog_api_timeout_ms});
+
+          // Freeze detection:
+          // Track changes vs last values, only update baseline if changed.
+          bool any_change = false;
+          if (!isnan(l1) && !isnan(id(wd_last_l1)) && fabsf(l1 - id(wd_last_l1)) > 0.01f) any_change = true;
+          if (phases >= 2 && !isnan(l2) && !isnan(id(wd_last_l2)) && fabsf(l2 - id(wd_last_l2)) > 0.01f) any_change = true;
+          if (phases >= 3 && !isnan(l3) && !isnan(id(wd_last_l3)) && fabsf(l3 - id(wd_last_l3)) > 0.01f) any_change = true;
+
+          if (any_change) {
+            id(wd_last_l1) = l1;
+            id(wd_last_l2) = l2;
+            id(wd_last_l3) = l3;
+            id(wd_last_change_ms) = now;
+          }
+
+          bool frozen =
+            (id(wd_last_change_ms) > 0) &&
+            ((now - id(wd_last_change_ms)) > ${watchdog_freeze_timeout_ms}) &&
+            api_stale;
+
+          // Determine fault condition
+          bool fault = false;
+          std::string reason = "-";
+
+          if (api_stale) {
+            fault = true;
+            reason = "HA API timeout";
+          } else if (!sensors_ok) {
+            fault = true;
+            reason = "Sensor unavailable";
+          } else if (frozen) {
+            fault = true;
+            reason = "Sensor frozen";
+          }
+
+          // Helper: compute worst phase, fallback high if NaN
+          auto compute_worst = [&](float a, float b, float c) -> float {
+            float w = isnan(a) ? 999.0f : a;
+            if (phases >= 2 && !isnan(b) && b > w) w = b;
+            if (phases >= 3 && !isnan(c) && c > w) w = c;
+            return w;
+          };
+
+          // Fault handling
+          if (fault) {
+            if (id(watchdog_last_fault_ms) == 0) {
+              id(watchdog_last_fault_ms) = now;
+            }
+
+            // Wait out the fault delay before taking control
+            if ((now - id(watchdog_last_fault_ms)) <= ${watchdog_fault_delay_ms}) {
+              return;
+            }
+
+            // Activate watchdog
+            id(watchdog_active) = true;
+            id(watchdog_reason) = reason;
+            ESP_LOGW("watchdog", "Watchdog ACTIVE: %s", reason.c_str());
+
+            float fuse = id(ha_main_fuse).state;
+            float wc_max = id(ha_wc_max_current).state;
+
+            float worst = compute_worst(l1, l2, l3);
+
+            // Keep same margin concept as calc_registers
+            const float SAFETY_MARGIN_A = 1.0f;
+
+            float headroom = fuse - worst - SAFETY_MARGIN_A;
+            if (headroom < 0.0f) headroom = 0.0f;
+
+            float fb = id(watchdog_fallback_current).state;
+            if (fb < 0.0f) fb = 0.0f;
+
+            // We want a "safe" target:
+            // - prefer fb
+            // - never exceed headroom or wc_max
+            float safe = fb;
+            if (safe > headroom) safe = headroom;
+            if (safe > wc_max) safe = wc_max;
+            if (safe < 0.0f) safe = 0.0f;
+
+            // UI integer choice (can be 0..)
+            float ui_amps = roundf(safe);
+
+            // HARD SAFETY CLAMP: never exceed floor(headroom)
+            float max_allowed = floorf(headroom);
+            if (max_allowed < 0.0f) max_allowed = 0.0f;
+            if (ui_amps > max_allowed) ui_amps = max_allowed;
+
+            if (ui_amps < 0.0f) ui_amps = 0.0f;
+            if (ui_amps > wc_max) ui_amps = wc_max;
+
+            // Apply setpoint
+            if (ui_amps <= 0.0f) {
+              id(target_current_internal_a) = 0.0f;
+              id(watchdog_forced_pause) = true;
+            } else {
+              id(target_current_internal_a) = ui_amps - 0.01f;
+              id(watchdog_forced_pause) = (ui_amps < 6.0f);
+            }
+
+            // Push out new simulated meter values immediately
+            id(calc_registers).execute();
+            return;
+
+          } else {
+            // No fault: clear fault timer
+            id(watchdog_last_fault_ms) = 0;
+          }
+
+          // Recovery logic after fault clears
+          if (id(watchdog_active)) {
+            if (id(watchdog_last_ok_ms) == 0) {
+              id(watchdog_last_ok_ms) = now;
+            }
+
+            if ((now - id(watchdog_last_ok_ms)) > ${watchdog_recover_delay_ms}) {
+              id(watchdog_active) = false;
+              id(watchdog_forced_pause) = false;
+              id(watchdog_reason) = "-";
+              id(watchdog_last_ok_ms) = 0;
+
+              ESP_LOGI("watchdog", "Recovered, releasing control back to Auto");
+              id(calc_registers).execute();
+            }
+          } else {
+            id(watchdog_last_ok_ms) = 0;
+          }
+
+modbus_controller:
+  # Modbus server emulating Tesla Neurio energy meter
+  - id: wc_mb_server
+    modbus_id: wallconn_modbus
+    address: 1
+
+    # Respond to any unknown register reads to avoid Wall Connector errors
+    server_courtesy_response:
+      enabled: true
+      register_last_address: 0xFFFF
+      register_value: 0
+
+    server_registers:
+      # Identity block required by Tesla Wall Connector (static values)
+      - { address: 1, value_type: U_WORD, read_lambda: 'return 0x3078;' }
+      - { address: 2, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 3, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 4, value_type: U_WORD, read_lambda: 'return 0x3034;' }
+      - { address: 5, value_type: U_WORD, read_lambda: 'return 0x3731;' }
+      - { address: 6, value_type: U_WORD, read_lambda: 'return 0x3442;' }
+      - { address: 7, value_type: U_WORD, read_lambda: 'return 0x3035;' }
+      - { address: 8, value_type: U_WORD, read_lambda: 'return 0x3638;' }
+      - { address: 9, value_type: U_WORD, read_lambda: 'return 0x3631;' }
+      - { address: 10, value_type: U_WORD, read_lambda: 'return 0x0000;' }
+      - { address: 11, value_type: U_WORD, read_lambda: 'return 0x312E;' }
+      - { address: 12, value_type: U_WORD, read_lambda: 'return 0x362E;' }
+      - { address: 13, value_type: U_WORD, read_lambda: 'return 0x312D;' }
+      - { address: 14, value_type: U_WORD, read_lambda: 'return 0x5465;' }
+      - { address: 15, value_type: U_WORD, read_lambda: 'return 0x736C;' }
+      - { address: 16, value_type: U_WORD, read_lambda: 'return 0x6100;' }
+      - { address: 17, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 18, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 19, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 20, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 21, value_type: U_WORD, read_lambda: 'return 0x3031;' }
+      - { address: 22, value_type: U_WORD, read_lambda: 'return 0x322E;' }
+      - { address: 23, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 24, value_type: U_WORD, read_lambda: 'return 0x3032;' }
+      - { address: 25, value_type: U_WORD, read_lambda: 'return 0x3041;' }
+      - { address: 26, value_type: U_WORD, read_lambda: 'return 0x2E48;' }
+      - { address: 27, value_type: U_WORD, read_lambda: 'return 0x0000;' }
+      - { address: 28, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 29, value_type: U_WORD, read_lambda: 'return 0x3930;' }
+      - { address: 30, value_type: U_WORD, read_lambda: 'return 0x3935;' }
+      - { address: 31, value_type: U_WORD, read_lambda: 'return 0x3400;' }
+      - { address: 32, value_type: U_WORD, read_lambda: 'return 0x5641;' }
+      - { address: 33, value_type: U_WORD, read_lambda: 'return 0x4834;' }
+      - { address: 34, value_type: U_WORD, read_lambda: 'return 0x3831;' }
+      - { address: 35, value_type: U_WORD, read_lambda: 'return 0x3041;' }
+      - { address: 36, value_type: U_WORD, read_lambda: 'return 0x4230;' }
+      - { address: 37, value_type: U_WORD, read_lambda: 'return 0x3233;' }
+      - { address: 38, value_type: U_WORD, read_lambda: 'return 0x3100;' }
+      - { address: 39, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 40, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 41, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 42, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 43, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 44, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 45, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 46, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 47, value_type: U_WORD, read_lambda: 'return 0x3034;' }
+      - { address: 48, value_type: U_WORD, read_lambda: 'return 0x3A37;' }
+      - { address: 49, value_type: U_WORD, read_lambda: 'return 0x313A;' }
+      - { address: 50, value_type: U_WORD, read_lambda: 'return 0x3442;' }
+      - { address: 51, value_type: U_WORD, read_lambda: 'return 0x3A30;' }
+      - { address: 52, value_type: U_WORD, read_lambda: 'return 0x353A;' }
+      - { address: 53, value_type: U_WORD, read_lambda: 'return 0x3638;' }
+      - { address: 54, value_type: U_WORD, read_lambda: 'return 0x3A36;' }
+      - { address: 55, value_type: U_WORD, read_lambda: 'return 0x3100;' }
+
+      # Secondary identity block required by Wall Connector handshake
+      - { address: 40002, value_type: U_WORD, read_lambda: 'return 0x0001;' }
+      - { address: 40003, value_type: U_WORD, read_lambda: 'return 0x0042;' }
+      - { address: 40004, value_type: U_WORD, read_lambda: 'return 0x4765;' }
+      - { address: 40005, value_type: U_WORD, read_lambda: 'return 0x6E65;' }
+      - { address: 40006, value_type: U_WORD, read_lambda: 'return 0x7261;' }
+      - { address: 40007, value_type: U_WORD, read_lambda: 'return 0x6300;' }
+
+      # Power measurement per phase and total (simulated Neurio)
+      - address: 0x88
+        value_type: FP32
+        read_lambda: |-
+          if (id(modbus_last_poll_ms) == 0) {
+            ESP_LOGI("modbus", "Wall Connector started polling Modbus");
+          }
+          id(modbus_last_poll_ms) = millis();
+          return id(ct1_power_w);
+
+      - address: 0x8A
+        value_type: FP32
+        read_lambda: return id(ct2_power_w);
+
+      - address: 0x8C
+        value_type: FP32
+        read_lambda: return id(ct3_power_w);
+
+      - address: 0x8E
+        value_type: FP32
+        read_lambda: return 0.0f;
+
+      - address: 0x90
+        value_type: FP32
+        read_lambda: return id(ct_total_w);
+
+      # Voltage per phase
+      - address: 0x94
+        value_type: FP32
+        read_lambda: return id(grid_voltage_v); 
+
+      - address: 0x96
+        value_type: FP32
+        read_lambda: return id(grid_voltage_v); 
+
+      - address: 0x98
+        value_type: FP32
+        read_lambda: return id(grid_voltage_v);
+      
+      # Grid frequency
+      - address: 0x9A
+        value_type: FP32
+        read_lambda: return 50.0;
+
+      # Current per phase and total
+      - address: 0xF4
+        value_type: FP32
+        read_lambda: return id(ct1_current_a);
+
+      - address: 0xF6
+        value_type: FP32
+        read_lambda: return id(ct2_current_a);
+
+      - address: 0xF8
+        value_type: FP32
+        read_lambda: return id(ct3_current_a);
+
+      - address: 0xFA
+        value_type: FP32
+        read_lambda: return 0.0f;
+
+      - address: 0xFC
+        value_type: FP32
+        read_lambda: return id(ct_total_a);
+
+      # Dummy fallback register to satisfy unexpected reads
+      - address: 0x00
+        value_type: FP32
+        read_lambda: return id(grid_voltage_v);
+
+
+interval:
+  # Periodic HA keepalive to prevent false API timeout when sensor values stay constant
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!isnan(id(ha_house_l1).state)) {
+            id(watchdog_last_ha_update_ms) = millis();
+          }
+  # Run watchdog logic frequently to detect sensor/API faults
+  - interval: 2s
+    then:
+      - script.execute: watchdog_check
+
+  # Status LED handling and Modbus activity indicator
+  - interval: 5s
+    then:
+      - globals.set:
+          id: led_is_internal_g
+          value: 'true'
+
+      - if:
+          condition:
+            lambda: return id(watchdog_active);
+          then:
+            # Blue blink = watchdog active
+            - light.turn_on:
+                id: status_led
+                red: 0%
+                green: 0%
+                blue: 100%
+                brightness: 80%
+            - delay: 200ms
+            - light.turn_off: status_led
+
+          else:
+            - if:
+                condition:
+                  lambda: return id(switch_auto_led_mode).state;
+                then:
+                  - if:
+                      condition:
+                        lambda: return (millis() - id(modbus_last_poll_ms)) < 3000;
+                      then:
+                        # Green blink = Wall Connector polling OK
+                        - light.turn_on:
+                            id: status_led
+                            red: 0%
+                            green: 100%
+                            blue: 0%
+                            brightness: 100%
+                        - delay: 120ms
+                        - light.turn_on:
+                            id: status_led
+                            red: 0%
+                            green: 10%
+                            blue: 0%
+                            brightness: 20%
+                      else:
+                        - if:
+                            condition:
+                              lambda: return (millis() - id(modbus_last_poll_ms)) > 10000;
+                            then:
+                              - lambda: |-
+                                  ESP_LOGD("modbus", "Wall Connector not polling Modbus for >10s");
+                              # Red = Wall Connector not polling
+                              - light.turn_on:
+                                  id: status_led
+                                  red: 100%
+                                  green: 0%
+                                  blue: 0%
+                                  brightness: 60%
+
+      - globals.set:
+          id: led_is_internal_g
+          value: 'false'
