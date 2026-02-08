@@ -1,0 +1,21 @@
+.DS_Store
+
+# ESPHome / PlatformIO build artifacts
+.esphome/
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ESPHome secrets (do not commit)
+secrets.yaml
+
+# Editors
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / temp
+*.log
+*.bak
