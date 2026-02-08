@@ -100,23 +100,52 @@ Below are a few photos from my own Wall Connector setup after wiring the ESP32/R
 
 ### Wall Connector configuration
 
-<img src="Unconfigred.jpg" alt="Wall Connector (unconfigured)" width="30%">
-
-<img src="Configured.png" alt="Wall Connector (configured)" width="30%">
-
-<img src="set20A.jpg" alt="Wall Connector setpoint example (20A)" width="30%">
+<table>
+  <tr>
+    <td align="center">
+      <img src="Unconfigred.jpg" alt="Wall Connector (unconfigured)" width="100%"><br>
+      <sub>Unconfigured</sub>
+    </td>
+    <td align="center">
+      <img src="Configured.png" alt="Wall Connector (configured)" width="100%"><br>
+      <sub>Configured</sub>
+    </td>
+    <td align="center">
+      <img src="set20A.jpg" alt="Wall Connector setpoint example (20A)" width="100%"><br>
+      <sub>Setpoint example (20A)</sub>
+    </td>
+  </tr>
+</table>
 
 ### Transformer / RS485 wiring
 
-<img src="transformer%201.jpg" alt="Transformer wiring 1" width="30%">
-
-<img src="transformer%202.jpg" alt="Transformer wiring 2" width="30%">
-
-<img src="transformer%203.jpg" alt="Transformer wiring 3" width="30%">
-
-<img src="transformer%204.jpg" alt="Transformer wiring 4" width="30%">
-
-<img src="transformer%20configured.jpg" alt="Transformer wiring (configured)" width="30%">
+<table>
+  <tr>
+    <td align="center">
+      <img src="transformer%201.jpg" alt="Transformer wiring 1" width="100%"><br>
+      <sub>1</sub>
+    </td>
+    <td align="center">
+      <img src="transformer%202.jpg" alt="Transformer wiring 2" width="100%"><br>
+      <sub>2</sub>
+    </td>
+    <td align="center">
+      <img src="transformer%203.jpg" alt="Transformer wiring 3" width="100%"><br>
+      <sub>3</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="transformer%204.jpg" alt="Transformer wiring 4" width="100%"><br>
+      <sub>4</sub>
+    </td>
+    <td align="center">
+      <img src="transformer%20configured.jpg" alt="Transformer wiring (configured)" width="100%"><br>
+      <sub>Configured</sub>
+    </td>
+    <td></td>
+  </tr>
+</table>
 
 ## Home Assistant controls and sensors
 
