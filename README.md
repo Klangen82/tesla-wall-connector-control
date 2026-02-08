@@ -100,23 +100,23 @@ Below are a few photos from my own Wall Connector setup after wiring the ESP32/R
 
 ### Wall Connector configuration
 
-![Wall Connector (unconfigured)](Unconfigred.jpg)
+<img src="Unconfigred.jpg" alt="Wall Connector (unconfigured)" width="30%">
 
-![Wall Connector (configured)](Configured.png)
+<img src="Configured.png" alt="Wall Connector (configured)" width="30%">
 
-![Wall Connector setpoint example (20A)](set20A.jpg)
+<img src="set20A.jpg" alt="Wall Connector setpoint example (20A)" width="30%">
 
 ### Transformer / RS485 wiring
 
-![Transformer wiring 1](<transformer 1.jpg>)
+<img src="transformer%201.jpg" alt="Transformer wiring 1" width="30%">
 
-![Transformer wiring 2](<transformer 2.jpg>)
+<img src="transformer%202.jpg" alt="Transformer wiring 2" width="30%">
 
-![Transformer wiring 3](<transformer 3.jpg>)
+<img src="transformer%203.jpg" alt="Transformer wiring 3" width="30%">
 
-![Transformer wiring 4](<transformer 4.jpg>)
+<img src="transformer%204.jpg" alt="Transformer wiring 4" width="30%">
 
-![Transformer wiring (configured)](<transformer configured.jpg>)
+<img src="transformer%20configured.jpg" alt="Transformer wiring (configured)" width="30%">
 
 ## Home Assistant controls and sensors
 
