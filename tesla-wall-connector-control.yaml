@@ -44,6 +44,9 @@ substitutions:
   house_phase1_entity: sensor.current_phase_1_2    # Phase 1 current sensor in Home Assistant (required for all setups)
   house_phase2_entity: sensor.current_phase_2_2    # Phase 2 current sensor (ignored if 1-phase, do not remove)
   house_phase3_entity: sensor.current_phase_3_2    # Phase 3 current sensor (ignored if 1- or 2-phase, do not remove)
+  wallconn_phase1_current_entity: sensor.tesla_wall_connector_phase_a_current
+  wallconn_phase2_current_entity: sensor.tesla_wall_connector_phase_b_current
+  wallconn_phase3_current_entity: sensor.tesla_wall_connector_phase_c_current
 
 esphome:
   name: ${device_name}
@@ -220,6 +223,28 @@ switch:
           id(auto_was_active) = false;
           id(calc_registers).execute();
 
+  # Experimental 3-phase feedback controller
+  - platform: template
+    id: experimental_feedback_control
+    name: "Tesla Experimental Dynamic Feedback"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    entity_category: "config"
+    turn_on_action:
+      - lambda: |-
+          id(experimental_feedback_initialized) = false;
+          id(experimental_feedback_base_per_phase_a) = 0.0f;
+          id(experimental_feedback_bias_a) = 0.0f;
+          ESP_LOGI("tesla", "Experimental dynamic feedback enabled");
+      - script.execute: calc_registers
+    turn_off_action:
+      - lambda: |-
+          id(experimental_feedback_initialized) = false;
+          id(experimental_feedback_base_per_phase_a) = 0.0f;
+          id(experimental_feedback_bias_a) = 0.0f;
+          ESP_LOGI("tesla", "Experimental dynamic feedback disabled");
+      - script.execute: calc_registers
+
   # Enables or disables watchdog safety logic
   - platform: template
     id: watchdog_enable
@@ -329,6 +354,18 @@ globals:
   # Final current setpoint actually sent to Tesla (rounded workaround)
   - id: target_current_internal_a
     type: float
+  # Experimental dynamic feedback model base current per phase
+  - id: experimental_feedback_base_per_phase_a
+    type: float
+    initial_value: "0.0"
+  # Experimental dynamic feedback model bias term
+  - id: experimental_feedback_bias_a
+    type: float
+    initial_value: "0.0"
+  # Experimental feedback initialization guard
+  - id: experimental_feedback_initialized
+    type: bool
+    initial_value: "false"
   # Tracks if Auto mode was previously active
   - id: auto_was_active
     type: bool
@@ -559,6 +596,30 @@ sensor:
     lambda: |-
       return id(ha_house_l3).state;
 
+  # Wall Connector feedback Phase A current
+  - platform: template
+    name: "Wall Connector Phase A Current Feedback"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    lambda: |-
+      return id(ha_wc_phase_a_current).state;
+
+  # Wall Connector feedback Phase B current
+  - platform: template
+    name: "Wall Connector Phase B Current Feedback"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    lambda: |-
+      return id(ha_wc_phase_b_current).state;
+
+  # Wall Connector feedback Phase C current
+  - platform: template
+    name: "Wall Connector Phase C Current Feedback"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    lambda: |-
+      return id(ha_wc_phase_c_current).state;
+
   # Home Assistant Phase 1 sensor (used by Auto mode and Watchdog)
   - platform: homeassistant
     id: ha_house_l1
@@ -567,7 +628,7 @@ sensor:
       then:
         - lambda: |-
             id(watchdog_last_ha_update_ms) = millis();
-            if (id(auto_load_control).state && !id(watchdog_active)) {
+            if ((id(auto_load_control).state || id(experimental_feedback_control).state) && !id(watchdog_active)) {
               id(calc_registers).execute();
             }
 
@@ -579,7 +640,7 @@ sensor:
       then:
         - lambda: |-
             id(watchdog_last_ha_update_ms) = millis();
-            if (id(auto_load_control).state && !id(watchdog_active)) {
+            if ((id(auto_load_control).state || id(experimental_feedback_control).state) && !id(watchdog_active)) {
               id(calc_registers).execute();
             }
 
@@ -591,7 +652,40 @@ sensor:
       then:
         - lambda: |-
             id(watchdog_last_ha_update_ms) = millis();
-            if (id(auto_load_control).state && !id(watchdog_active)) {
+            if ((id(auto_load_control).state || id(experimental_feedback_control).state) && !id(watchdog_active)) {
+              id(calc_registers).execute();
+            }
+
+  # Fast Wall Connector Phase A current feedback
+  - platform: homeassistant
+    id: ha_wc_phase_a_current
+    entity_id: ${wallconn_phase1_current_entity}
+    on_value:
+      then:
+        - lambda: |-
+            if ((id(auto_load_control).state || id(experimental_feedback_control).state) && !id(watchdog_active)) {
+              id(calc_registers).execute();
+            }
+
+  # Fast Wall Connector Phase B current feedback
+  - platform: homeassistant
+    id: ha_wc_phase_b_current
+    entity_id: ${wallconn_phase2_current_entity}
+    on_value:
+      then:
+        - lambda: |-
+            if ((id(auto_load_control).state || id(experimental_feedback_control).state) && !id(watchdog_active)) {
+              id(calc_registers).execute();
+            }
+
+  # Fast Wall Connector Phase C current feedback
+  - platform: homeassistant
+    id: ha_wc_phase_c_current
+    entity_id: ${wallconn_phase3_current_entity}
+    on_value:
+      then:
+        - lambda: |-
+            if ((id(auto_load_control).state || id(experimental_feedback_control).state) && !id(watchdog_active)) {
               id(calc_registers).execute();
             }
 
@@ -703,10 +797,17 @@ script:
           float l2 = id(ha_house_l2).state;
           float l3 = id(ha_house_l3).state;
 
+          // Fast Wall Connector current feedback from HA
+          float wc1 = id(ha_wc_phase_a_current).state;
+          float wc2 = id(ha_wc_phase_b_current).state;
+          float wc3 = id(ha_wc_phase_c_current).state;
+
           // Validate that required sensors are available (for selected phase count)
           bool has_house_load = !isnan(l1);
           if (phases >= 2) has_house_load = has_house_load && !isnan(l2);
           if (phases >= 3) has_house_load = has_house_load && !isnan(l3);
+
+          bool has_wc_feedback = !isnan(wc1) && !isnan(wc2) && !isnan(wc3);
 
           // If watchdog is active, do NOT change target_current_internal_a here
           bool watchdog = id(watchdog_active);
@@ -805,49 +906,128 @@ script:
           // Update simulated Neurio values (always, even under watchdog)
           // --------------------------
 
+          bool experimental_requested = id(experimental_feedback_control).state;
+          bool experimental = experimental_requested && phases == 3 && has_house_load && has_wc_feedback;
+          if (experimental_requested && !experimental) {
+            ESP_LOGW("tesla", "Experimental mode requested but 3-phase mode or required feedback sensors are missing, falling back to static model");
+          }
+
           // Simulated Neurio load seen by Wall Connector
-          float fake_load = fuse - id(target_current_internal_a);
-          if (fake_load < 0.0f) fake_load = 0.0f;
+          if (experimental) {
+            float target_amps = id(target_current_internal_a);
+            if (target_amps > 0.0f) {
+              target_amps = roundf(target_amps);
+            }
 
-          // Publish simulated current per phase
-          id(ct1_current_a) = fake_load;
-          id(ct2_current_a) = (phases >= 2) ? fake_load : 0.0f;
-          id(ct3_current_a) = (phases >= 3) ? fake_load : 0.0f;
-          id(ct_total_a) = fake_load * phases;
+            float wc_avg = (wc1 + wc2 + wc3) / 3.0f;
+            float house_avg = (l1 + l2 + l3) / 3.0f;
 
-          // Publish simulated power per phase
-          id(ct1_power_w) = voltage * fake_load;
-          id(ct2_power_w) = (phases >= 2) ? voltage * fake_load : 0.0f;
-          id(ct3_power_w) = (phases >= 3) ? voltage * fake_load : 0.0f;
-          id(ct_total_w) = voltage * fake_load * phases;
+            // Keep the static model's nominal headroom, then bias it with charger feedback.
+            float desired_base = fuse - target_amps;
+            if (desired_base < 0.0f) desired_base = 0.0f;
+
+            if (!id(experimental_feedback_initialized)) {
+              id(experimental_feedback_initialized) = true;
+              id(experimental_feedback_base_per_phase_a) = desired_base;
+              id(experimental_feedback_bias_a) = 0.0f;
+            }
+
+            // Positive error means the charger is drawing more than requested,
+            // so the fake meter should look heavier to pull it back down.
+            float error = wc_avg - target_amps;
+            if (fabsf(error) < 0.4f) error = 0.0f;
+            float bias_target = error * 0.35f;
+            if (bias_target > 1.5f) bias_target = 1.5f;
+            if (bias_target < -1.5f) bias_target = -1.5f;
+
+            // Low-pass filter the bias so it changes realistically.
+            id(experimental_feedback_bias_a) = (id(experimental_feedback_bias_a) * 0.8f) + (bias_target * 0.2f);
+
+            float desired_base_with_bias = desired_base + id(experimental_feedback_bias_a);
+            float step = desired_base_with_bias - id(experimental_feedback_base_per_phase_a);
+            if (step > 0.75f) step = 0.75f;
+            if (step < -0.75f) step = -0.75f;
+            id(experimental_feedback_base_per_phase_a) += step;
+
+            // Shape the per-phase output a little so it does not look perfectly flat.
+            float house_offset_l1 = (l1 - house_avg) * 0.35f;
+            float house_offset_l2 = (l2 - house_avg) * 0.35f;
+            float house_offset_l3 = (l3 - house_avg) * 0.35f;
+
+            float fake1 = id(experimental_feedback_base_per_phase_a) + house_offset_l1;
+            float fake2 = id(experimental_feedback_base_per_phase_a) + house_offset_l2;
+            float fake3 = id(experimental_feedback_base_per_phase_a) + house_offset_l3;
+
+            if (fake1 < 0.0f) fake1 = 0.0f;
+            if (fake2 < 0.0f) fake2 = 0.0f;
+            if (fake3 < 0.0f) fake3 = 0.0f;
+
+            id(ct1_current_a) = fake1;
+            id(ct2_current_a) = fake2;
+            id(ct3_current_a) = fake3;
+            id(ct_total_a) = fake1 + fake2 + fake3;
+
+            id(ct1_power_w) = voltage * fake1;
+            id(ct2_power_w) = voltage * fake2;
+            id(ct3_power_w) = voltage * fake3;
+            id(ct_total_w) = voltage * (fake1 + fake2 + fake3);
+
+            ESP_LOGD("tesla-exp",
+              "3PH EXP: target=%.2fA wc=%.2fA house=(%.2f,%.2f,%.2f) base=%.2f bias=%.2f fake=(%.2f,%.2f,%.2f)",
+              target_amps,
+              wc_avg,
+              l1, l2, l3,
+              id(experimental_feedback_base_per_phase_a),
+              id(experimental_feedback_bias_a),
+              fake1, fake2, fake3
+            );
+          } else {
+            float fake_load = fuse - id(target_current_internal_a);
+            if (fake_load < 0.0f) fake_load = 0.0f;
+
+            // Publish simulated current per phase
+            id(ct1_current_a) = fake_load;
+            id(ct2_current_a) = (phases >= 2) ? fake_load : 0.0f;
+            id(ct3_current_a) = (phases >= 3) ? fake_load : 0.0f;
+            id(ct_total_a) = fake_load * phases;
+
+            // Publish simulated power per phase
+            id(ct1_power_w) = voltage * fake_load;
+            id(ct2_power_w) = (phases >= 2) ? voltage * fake_load : 0.0f;
+            id(ct3_power_w) = (phases >= 3) ? voltage * fake_load : 0.0f;
+            id(ct_total_w) = voltage * fake_load * phases;
+          }
 
           // Debug output for calculation tracing
           float headroom_dbg = NAN;
           if (!isnan(worst_phase)) headroom_dbg = fuse - worst_phase;
 
           ESP_LOGD("tesla-debug",
-            "Fuse=%.1f, L1=%.2f, L2=%.2f, L3=%.2f, Worst=%.2f, Headroom=%.2f, Setpoint=%.2f, Watchdog=%s",
+            "Fuse=%.1f, L1=%.2f, L2=%.2f, L3=%.2f, Worst=%.2f, Headroom=%.2f, Setpoint=%.2f, Watchdog=%s, Strategy=%s",
             fuse,
             l1, l2, l3,
             worst_phase,
             headroom_dbg,
             id(target_current_internal_a),
-            watchdog ? "YES" : "NO"
+            watchdog ? "YES" : "NO",
+            experimental ? "EXP-3PH" : "STATIC"
           );
 
           // Summary log for normal operation
           if (id(auto_load_control).state) {
             ESP_LOGD("tesla",
-              "Mode=AUTO%s, Setpoint=%.2fA, WorstPhase=%.2f",
+              "Mode=AUTO%s, Setpoint=%.2fA, WorstPhase=%.2f, Strategy=%s",
               watchdog ? " (WATCHDOG)" : "",
               id(target_current_internal_a),
-              worst_phase
+              worst_phase,
+              experimental ? "EXP-3PH" : "STATIC"
             );
           } else {
             ESP_LOGI("tesla",
-              "Mode=MANUAL%s, Setpoint=%.2fA",
+              "Mode=MANUAL%s, Setpoint=%.2fA, Strategy=%s",
               watchdog ? " (WATCHDOG)" : "",
-              id(target_current_internal_a)
+              id(target_current_internal_a),
+              experimental ? "EXP-3PH" : "STATIC"
             );
           }
 
@@ -1143,6 +1323,11 @@ modbus_controller:
       - address: 0x90
         value_type: FP32
         read_lambda: return id(ct_total_w);
+
+      # Reserved in the reference Neurio profile
+      - address: 0x92
+        value_type: U_WORD
+        read_lambda: return 0;
 
       # Voltage per phase
       - address: 0x94
