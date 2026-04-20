@@ -1,5 +1,32 @@
 # Tesla Wall Connector Control (Gen 3)
 
+## ⚠️ Disclaimer – Firmware 26.2+ (Breaking change)
+
+> **Important:**  
+> This solution **does NOT work with Tesla Wall Connector Gen 3 firmware 26.2 and newer.**
+
+This project works as expected on firmware versions **prior to 26.2**.
+
+With firmware **26.2+**, the Wall Connector behavior appears to have changed and **ignores external current limits during active charging**.
+
+### Observed behavior
+
+- ✅ Load balancing works **when idle (no vehicle charging)**
+- ❌ Once charging starts, current ramps to configured maximum
+- ❌ RS485/Modbus current limits are ignored during charging
+
+### Status
+
+- ❌ Not working on firmware 26.2+
+- ❌ Firmware downgrade not possible
+- ⚠️ Likely due to internal current measurement taking priority over external meter data
+
+If you are running firmware 26.2 or newer, **this project will not provide load balancing functionality**.
+
+Contributions, findings, or workarounds are very welcome.
+
+---
+
 ESPHome configuration to dynamically control a **Tesla Wall Connector Gen 3** by **emulating a Tesla/Neurio energy meter** over **RS485/Modbus**.
 
 The goal is load balancing: the Wall Connector adjusts charge current so your house **main fuse** is not overloaded, based on per-phase current readings from Home Assistant.
