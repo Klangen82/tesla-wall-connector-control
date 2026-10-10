@@ -1,0 +1,36 @@
+# HOME ASSISTANT configuration, not an ESPHome device configuration.
+# Merge this template entry into HA configuration.yaml (or a HA package).
+# Used by Auto and load-balanced Manual; ignored by Manual Fixed/Unregulated.
+# Adapt the entity list to the selected grid phases; 1 phase needs only L1.
+# Verify last_reported advances on REAL meter reports even at constant current.
+# For MQTT sources, force_update may be needed; cached/replayed reports do not
+# prove a new physical measurement. Prefer a genuine device heartbeat if present.
+# The 45 s threshold must exceed your meter's verified normal report interval.
+template:
+  - triggers:
+      - trigger: time_pattern
+        seconds: "/5"
+      - trigger: homeassistant
+        event: start
+    binary_sensor:
+      - name: "Tesla House Current Reporting"
+        unique_id: tesla_house_current_reporting
+        device_class: connectivity
+        state: >-
+          {% set entities = ['sensor.your_phase1_current',
+                             'sensor.your_phase2_current',
+                             'sensor.your_phase3_current'] %}
+          {% set ns = namespace(ok=true) %}
+          {% for entity in entities %}
+            {% if not is_number(states(entity)) %}
+              {% set ns.ok = false %}
+            {% else %}
+              {% set age = as_timestamp(now()) - as_timestamp(states[entity].last_reported, 0) %}
+              {% if age < 0 or age >= 45 %}
+                {% set ns.ok = false %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ok }}
+        attributes:
+          checked_at_ts: "{{ as_timestamp(now()) }}"
