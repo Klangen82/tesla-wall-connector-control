@@ -63,7 +63,7 @@ inline int deserializeJson(JsonDocument&, const char*, size_t) { return 0; }
 '''
 TEST = r'''
 #include "components/twc_vitals/twc_vitals.h"
-#include "twc_control.h"
+#include "components/twc_vitals/twc_control.h"
 #include <cassert>
 #include <cstring>
 #include <iostream>

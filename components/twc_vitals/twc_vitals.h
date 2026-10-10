@@ -1,5 +1,6 @@
 #pragma once
 
+#include "twc_control.h"
 #include "esphome/core/component.h"
 #include "esp_http_client.h"
 #include "freertos/FreeRTOS.h"
