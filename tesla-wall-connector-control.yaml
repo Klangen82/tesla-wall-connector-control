@@ -53,8 +53,6 @@ substitutions:
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
-  includes:
-    - twc_control.h
   on_boot:
     priority: 600.0
     then:
@@ -139,9 +137,12 @@ web_server:
 
 external_components:
   - source:
-      type: local
-      path: components
+      type: git
+      url: https://github.com/Klangen82/tesla-wall-connector-control
+      # Pinned component version; update together with this YAML.
+      ref: 8a6392441f6462b0dd100fb0c764c7f83d6bb348
     components: [twc_vitals]
+    refresh: never
 
 twc_vitals:
   id: wallconn_vitals

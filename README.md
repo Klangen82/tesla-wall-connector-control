@@ -148,29 +148,36 @@ sensors too.
 | `house_sensor_timeout_ms` | Optional age limit for each phase's received samples. Default 0 uses HA availability and API connection; enable a timeout only if your source sends recurring unchanged readings. |
 | `house_meter_reporting_entity` | Optional HA reporting helper, default `binary_sensor.tesla_house_current_reporting`. Enable its guard only after configuring and verifying the helper. |
 
-Install the files with this layout inside your ESPHome configuration directory
-(typically `/config/esphome/` in Home Assistant):
+Copy only `tesla-wall-connector-control.yaml` into your ESPHome configuration
+directory (typically `/config/esphome/` in Home Assistant), alongside your
+`secrets.yaml`:
 
 ```text
 tesla-wall-connector-control.yaml
-twc_control.h
 secrets.yaml
-components/
-  twc_vitals/
-    __init__.py
-    twc_vitals.h
-    twc_vitals.cpp
 ```
+
+ESPHome downloads `twc_vitals` and its bundled `twc_control.h` directly from
+GitHub during configuration validation/build. You do not need a local
+`twc_control.h` or `components/twc_vitals/` folder. After switching to this YAML,
+you can remove the old local copies if no other configurations use them.
+Internet access is required for the first download or after clearing the cache.
+No GitHub access is needed by the flashed device at runtime.
+
+The `external_components` source is pinned to a specific commit with
+`refresh: never`, so rebuilding the same YAML uses the same controller code.
+When updating, copy the new YAML including its matching `ref`, while preserving
+your own substitutions and secrets. Do not change the ref to `main`: this
+experimental component lives on the test branch. See ESPHome's
+[external components documentation](https://esphome.io/components/external_components/).
 
 `examples/` contains the optional Home Assistant reporting helper, and `tests/`
 contains development checks. Neither folder needs to be copied to ESPHome or
 is included in the flashed firmware. The images are used by this README.
 
-Keep the component files inside `components/twc_vitals/`, not directly inside
-`components/`. When updating, copy the YAML, controller header and complete
-component folder together, preserving your own substitutions and secrets. The local component polls HTTP on a
-FreeRTOS worker task and transfers complete snapshots through a queue; it does
-not block the ESPHome main loop or compute anything inside a Modbus read.
+The component polls HTTP on a FreeRTOS worker task and transfers complete
+snapshots through a queue; it does not block the ESPHome main loop or compute
+anything inside a Modbus read.
 
 You also need these `!secret` values for ESPHome/Home Assistant:
 
@@ -483,8 +490,8 @@ reaction thresholds and sustained sessions still need to be checked on-device.
 
 ## Quick start
 
-1. Install ESPHome 2026.9.0 or newer. Copy all required files using the layout
-   above and provide the secrets.
+1. Install ESPHome 2026.9.0 or newer. Copy the YAML and provide the secrets.
+   ESPHome downloads the pinned component from GitHub automatically.
 2. Set the charger IP, hardware pins and phase count. For Auto/Manual, replace
    the house entity IDs with your actual per-phase current sensors.
 3. Validate and install through ESPHome. Use USB for the first installation;
@@ -505,8 +512,8 @@ esphome run tesla-wall-connector-control.yaml
 
 When updating an existing installation, preserve your corrected sensor IDs.
 A changed README or test file does not need to be copied to the device; firmware
-changes require copying the affected YAML/header/component files and installing
-again. The HA helper belongs in HA's configuration, not in ESPHome.
+changes require copying the updated YAML with its matching component ref and
+installing again. The HA helper belongs in HA's configuration, not in ESPHome.
 
 ## Troubleshooting
 
@@ -579,7 +586,10 @@ recovery, input expiry, mode transitions and millis rollover. Passing them
 checks the software requests. The vitals tests cover retained snapshots,
 expiry, request diagnostics, recovery and clock rollover with host-side stubs.
 The HA helper tests require Python packages `jinja2` and `pyyaml`. Validation
-and compilation require ESPHome and valid local secrets. These checks do not
+and compilation require ESPHome, valid local secrets and network access for
+the initial GitHub component download. For local component development, replace
+the Git source with `source: {type: local, path: components}` and remove
+`refresh: never` in a separate development copy of the YAML. These checks do not
 contact or flash the charger, model its regulation behavior or prove acceptance
 of the emulated meter.
 
