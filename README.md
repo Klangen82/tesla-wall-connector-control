@@ -30,6 +30,7 @@ compatibility with later Tesla firmware releases.
 | `Auto` | Calculates an available charging target from the worst-phase household load, main fuse, safety margin and software charge ceiling. |
 | `Manual` | Regulates toward `Manual Target Setpoint`, capped by the same electrical limits. Set 0 A to request pause; a target below 6 A also requests pause. |
 | `Manual Fixed` | Regulates toward the same manual setpoint, capped by `Wall Connector Max Current`. Requires fresh charger feedback, but no HA connection, house sensors or reporting helper. Bypasses household load balancing and main-fuse protection. 0 A or a target below 6 A requests pause. |
+| `Solar Surplus` | Uses signed grid measurements to target the weakest phase's solar surplus. Requires stable surplus before starting; short deficits can use a configurable 6 A grace period with grid import. Electrical/data guards always win. |
 | `Unregulated` | Keeps RS485 replies alive with a low, alternating meter reading. Bypasses the software target, main-fuse protection and watchdog. Tesla One's configured output ceiling and the vehicle determine actual current. |
 
 The selected mode is restored after reboot. The old `Tesla Wall Connector Auto
@@ -51,13 +52,14 @@ target if the software ceiling permits it and no recovery cap is active.
 Selecting 16 A does not guarantee 16 A actual current: the vehicle, charger
 settings and feedback controller can limit the result.
 
-| Requirement or limit | Auto | Manual | Manual Fixed | Unregulated |
-| --- | --- | --- | --- | --- |
-| HA state subscription and required house sensors | Required | Required | Not required | Not required |
-| Fresh Wall Connector feedback | Required | Required | Required | Not required |
-| Household fuse, safety margin and reporting guard | Applied | Applied | Bypassed | Bypassed |
-| Manual slider | Ignored | Applied | Applied | Ignored |
-| Software charge ceiling and recovery watchdog | Applied | Applied | Applied | Bypassed |
+| Requirement or limit | Auto | Manual | Manual Fixed | Solar Surplus | Unregulated |
+| --- | --- | --- | --- | --- | --- |
+| HA subscription and required meter sensors | Required | Required | Not required | Required | Not required |
+| Signed power + RMS current + voltage | Optional | Optional | Ignored | Required | Ignored |
+| Fresh Wall Connector feedback | Required | Required | Required | Required | Not required |
+| Household fuse, safety margin and reporting guard | Applied | Applied | Bypassed | Applied | Bypassed |
+| Manual slider | Ignored | Applied | Applied | Ignored | Ignored |
+| Software charge ceiling and recovery watchdog | Applied | Applied | Applied | Applied | Bypassed |
 
 All modes initially publish a boot pause request. Manual Fixed continues using
 its selected setpoint when HA disconnects; editing it remotely still requires
@@ -95,10 +97,12 @@ For Auto and Manual, you must provide entity_ids for service-incomer current **p
 **amperes**, **including the charger's own consumption**. Auto/Manual subtract
 the measured charger branch once to estimate the rest of the house. Do not
 supply a house-only measurement and do not add the charger current again.
-This version expects nonnegative import current; solar export / net-metering
-control is not implemented.
+The default `Current Only` source expects nonnegative import current. For solar
+installations, use the signed grid source described below; unsigned current
+alone cannot distinguish import from export.
 
-Accepted sensor types:
+Accepted sensor types for the default Current Only source (the signed source
+also requires W and V, as described under Configuration):
 
 - ✅ `sensor.<something>_l1_current` in A
 - ❌ Not power (W / kW)
@@ -112,6 +116,9 @@ Supported setups for Auto and Manual:
 - 3-phase: Phase 1 + Phase 2 + Phase 3 required
 
 ## Configuration
+
+Solar Surplus and the signed grid source are new experimental additions. They
+have software scenario coverage but have not yet been verified on hardware.
 
 Most things you need to change are at the top of `tesla-wall-connector-control.yaml` under `substitutions:`:
 
@@ -131,6 +138,67 @@ can remain. Manual Fixed and Unregulated do not require house sensor entities.
 When using the optional HA example, replace its entity list with the same
 sensors too.
 
+### Signed grid measurements and solar surplus (experimental)
+
+For a Fronius Smart Meter at the grid interconnection point, enable **Real power
+phase 1/2/3**, **Current phase 1/2/3**, and **Voltage phase 1/2/3** in HA. Other
+meters can be used if they provide the same measurements. Use phase-neutral
+volts, not phase-to-phase voltage. The meter must include the charger and solar
+installation, and phase ordering must match the charger's feedback.
+
+Configure these placeholders for each active phase:
+
+| Substitution | Measurement |
+| --- | --- |
+| `house_phase1/2/3_entity` | Grid meter RMS current in A. |
+| `grid_phase1/2/3_power_entity` | Signed real power in W: positive import, negative export. |
+| `grid_phase1/2/3_voltage_entity` | Voltage from that phase to neutral in V. |
+
+Then select **Grid Measurement Source → Signed Power + Current**. Verify signs
+against known import and export first. Auto and Manual use these readings for
+fuse headroom; Manual Fixed and Unregulated continue to ignore them. Selecting
+Solar Surplus with Current Only requests pause with invalid-settings status.
+The source selector is restored, and defaults to Current Only for compatibility.
+
+The controller estimates active current as `P/V`, with a non-active component
+from `max(0, RMS_current² - active_current²)`. Fuse capacity keeps that component
+in the calculation instead of treating W/V as total current. This assumes the
+EV adds approximately unity-power-factor active current. It is an experimental
+estimate, not a replacement for electrical protection. Nonfinite readings,
+invalid voltage/current ranges and strongly inconsistent P/V vs RMS current
+request pause. Reactive power sensors are not required by this implementation.
+
+Solar Surplus uses the **least exporting active phase**, with EV consumption
+subtracted once to estimate the household balance. It does not average phases
+for billing, switch phases automatically or use total inverter production.
+Set Grid Phase Count to the actual charging setup and verify the phase mapping.
+
+- **Solar Start Stable Time**: default 30 seconds of surplus above 6 A plus
+  Tesla Restart Headroom Margin before starting or restarting.
+- **Solar Deficit Grace Time**: default 60 seconds. Only an already charging
+  solar session may hold a 6 A target during a short deficit. Grid import is
+  explicitly allowed during grace. Set 0 for no grace.
+- Grace ends immediately for missing/invalid data or inadequate fuse capacity.
+  Once the deficit timer expires, pause is requested and stable restart is
+  required. It cannot keep rearming while the car slows down.
+
+A new EV feedback value does not repeatedly change the inferred household
+balance while signed real power is unchanged. The active household estimate is
+refreshed when real power changes, pairing it with the latest EV feedback. RMS
+current and voltage still update electrical capacity independently. HA values are
+not guaranteed to arrive as an atomic measurement, and receive time is not the
+physical sample time. Slow/asynchronous meters can still cause transient
+invalid readings or inaccurate estimates. Verify cadence and test load steps
+before relying on this mode. `house_sensor_timeout_ms`, when enabled, applies
+to current, power and voltage receive ages; enable it only with recurring
+reports, including at unchanged load. For the optional reporting helper, include
+**all required current, power and voltage entities** in its entity list.
+
+Pause still uses the experimental overload-based request. This change does
+**not** establish an error-free stop or reliable automatic restart on every
+vehicle/firmware. Test actual contactor opening and restart on your installation.
+Missing data and overload keep the protective response; no cloud grace applies.
+
 ### YAML `substitutions` reference
 
 | Key | What it does |
@@ -142,7 +210,7 @@ sensors too.
 | `house_phase2_entity` | Home Assistant entity_id for **Phase 2 current in A** (required in Auto/Manual for 2-/3-phase). |
 | `house_phase3_entity` | Home Assistant entity_id for **Phase 3 current in A** (required in Auto/Manual for 3-phase). |
 | `watchdog_fault_delay_ms` | Fault duration before latching recovery, initially 8 s. Missing required data requests pause immediately; this delay does not postpone that pause. |
-| `watchdog_recover_delay_ms` | Continuous healthy-data recovery period before releasing the fallback cap in all three regulated modes. |
+| `watchdog_recover_delay_ms` | Continuous healthy-data recovery period before releasing the fallback cap in all four regulated modes. |
 | `wallconn_ip` | Required for Auto, Manual and Manual Fixed: replace `YOUR_WALL_CONNECTOR_IP` with the local charger IP. Used to poll complete vitals snapshots every 2 seconds. |
 | `vitals_timeout_ms` | Maximum age of a successful complete snapshot, initially 8 seconds. Failed polls retain the last complete valid snapshot only until this age limit; they never refresh its timestamp. |
 | `house_sensor_timeout_ms` | Optional age limit for each phase's received samples. Default 0 uses HA availability and API connection; enable a timeout only if your source sends recurring unchanged readings. |
@@ -283,7 +351,7 @@ After adding the device to ESPHome/HA you’ll get entities like the ones below 
 
 | Entity | Type | What it does |
 | --- | --- | --- |
-| `Tesla Control Mode` | select | Auto / Manual / Manual Fixed / Unregulated; restored after restart. |
+| `Tesla Control Mode` | select | Auto / Manual / Manual Fixed / Solar Surplus / Unregulated; restored after restart. |
 | `Tesla Wall Connector Auto Mode` | switch | Compatibility switch: ON selects Auto; OFF selects Manual. |
 | `Manual Target Setpoint` | number | Requested current in both manual modes (0 A requests pause); retained independently of mode and software max. |
 | `House Main Fuse` | number | Main fuse rating in A for Auto/Manual load balancing; ignored in Manual Fixed and Unregulated. |
@@ -295,7 +363,7 @@ After adding the device to ESPHome/HA you’ll get entities like the ones below 
 | `House Meter Reporting Guard` | switch | Auto/Manual: optional HA reporting/evaluation heartbeat guard. Default OFF; install and verify the example helper before enabling. |
 | `Grid Phase Count` | select | Select 1/2/3 phases. Determines active simulated channels and required Auto/Manual house sensors. |
 | `Grid Voltage` | select | Used for simulated power values (W). Does not change current-limit math (which is based on amperes). |
-| `Tesla Watchdog Enable` | switch | Enables delayed fault latching and fallback recovery in all three regulated modes. Missing-data guards always request pause; the watchdog does not run in Unregulated. |
+| `Tesla Watchdog Enable` | switch | Enables delayed fault latching and fallback recovery in all four regulated modes. Missing-data guards always request pause; the watchdog does not run in Unregulated. |
 | `Tesla Watchdog Fallback Current` | number | Additional cap during healthy-data recovery, clamped to the charge ceiling and selected target; Auto/Manual also respect house headroom. Missing measurements request pause instead. |
 | `ESPHome Log Level` | select | ERROR/WARN/INFO/DEBUG. VERBOSE is deliberately unavailable to avoid delaying Modbus replies. |
 | `Auto Status LED` | switch | Enables automatic status LED behavior (polling/watchdog indication). |
@@ -306,12 +374,14 @@ After adding the device to ESPHome/HA you’ll get entities like the ones below 
 
 | Entity | Type | What it shows |
 | --- | --- | --- |
-| `House Load Phase 1/2/3` | sensor | Current per phase (A) as received from your Home Assistant sensors. |
+| `House Load Phase 1/2/3` | sensor | Current per phase (A) as received from HA, published every 2 seconds. This display cadence does not prove the physical meter sample cadence. |
 | `Tesla Wall Connector Effective Setpoint` | sensor | Effective software target after limits, 0 for pause; unavailable in Unregulated. This is not measured current or the Neurio register value. |
 | `Tesla Actual Charge Current` | sensor | Charger-measured current from the last valid snapshot; unavailable when it expires. |
 | `Tesla Available Charge Headroom` | sensor | Estimated available charger current after household load and margin in Auto/Manual; unavailable in Manual Fixed and Unregulated. |
 | `Neurio Emulated Phase A/B/C Current` | sensor | Published meter readings used to request charger behavior. |
 | `Tesla Feedback Healthy` | binary sensor | Whether a complete, valid vitals snapshot is fresh. |
+| `Tesla Feedback Last Failure` | text | Retains the last failed-poll reason after feedback recovers, to help correlate historical pauses. |
+| `Tesla Actual Phase 1/2/3 Current` / `Tesla Contactor Closed` | diagnostic | Per-phase charger feedback and contactor state. Phase currents become unavailable when feedback expires; the contactor indicator is false then, so check Feedback Healthy too. |
 | `Tesla Feedback Request Status` | text | Last request result: OK, network loss, timeout, transport/status error, buffer overflow, invalid JSON or invalid fields. |
 | `Tesla Feedback Response Time` / `Tesla Feedback HTTP Status` | sensor | Latest attempt's duration and HTTP status; transport failures can report 0 or a negative status instead of an HTTP response code. |
 | `Tesla Feedback Last Success Age` | sensor | Seconds since the last valid complete snapshot; unavailable before the first success. |
@@ -365,7 +435,7 @@ and removes the `-0.01 A` UI workaround. It uses Tesla One's conductor limit `L`
 - Electrical budgets override that tolerance and delay. In Auto/Manual,
   consumption above fuse-minus-margin triggers immediate reduction and above
   the main fuse triggers a hard reduction request at `L + 1.2 A`. The software
-  charge ceiling triggers immediate reduction in all three regulated modes.
+  charge ceiling triggers immediate reduction in all four regulated modes.
 - Pause, boot, or missing regulated-mode inputs: publish `L + 1.2 A`.
 - Every active channel has a time-based +/-0.05 A dither. It is not a freshness
   heartbeat and does not prove that the meter is trusted.
@@ -462,6 +532,17 @@ requested**, not a confirmed open contactor or zero current.
 
 ## Supervised firmware 26.34.0 bring-up
 
+For the new signed grid source, verify import/export sign, RMS current, voltage,
+phase mapping and actual update cadence. Test Auto with both import and export,
+then a real load increase and an EV current decrease. Record the raw source
+entities as well as controller diagnostics to detect mismatched sample times.
+For Solar Surplus, test stable start, a short deficit with bounded grace,
+a sustained deficit reaching pause, and stable restart. During grace verify
+actual current reduces toward 6 A and observe temporary grid import. Inject a
+missing power/current/voltage value and expired charger feedback to confirm
+immediate protective pause rather than cloud grace. Test with grace 0 too.
+The software timers do not prove that the charger honors the requested current.
+
 1. Confirm the HA entity IDs, phase count and charger IP. The entities in the
    YAML are the main branch's originals; adapt them to your actual meter.
 2. In the web UI/HA, set the real main fuse, charge ceiling, safety margin and
@@ -521,7 +602,7 @@ installing again. The HA helper belongs in HA's configuration, not in ESPHome.
   restarts or goes offline. Auto/Manual invalidate that phase and request pause;
   recovery requires numeric readings again. Manual Fixed ignores house sensors.
 - A house display still shows an old value: the `House Load Phase` display
-  templates refresh every 60 s. Control receives source updates immediately;
+  templates refresh every 2 s. Control receives source updates immediately;
   inspect sensor status and received-value ages for invalid data.
 - An occasional HTTP warning followed by recovery: inspect last-success age,
   rather than only the latest request status. A valid snapshot remains usable
@@ -571,6 +652,10 @@ Thanks also to the authors of the earlier meter-emulation reference gists:
 
 ## Development checks
 
+Solar start/grace controls are separate from the original load-budget restart
+delay. The optional reporting guard applies in Solar Surplus too.
+
+
 ```bash
 clang++ -std=c++17 -Wall -Wextra -Werror tests/twc_control_test.cpp -o /tmp/twc-control-test
 /tmp/twc-control-test
@@ -580,7 +665,8 @@ esphome config tesla-wall-connector-control.yaml
 esphome compile tesla-wall-connector-control.yaml
 ```
 
-The scenarios cover all four modes, house measurements including the EV,
+The scenarios cover all five modes, signed import/export, non-active current,
+solar start/deficit timers and unchanged-meter/EV-ramp behavior, house measurements including the EV,
 uneven phases, manual tolerance/persistence, electrical limits, pause, watchdog
 recovery, input expiry, mode transitions and millis rollover. Passing them
 checks the software requests. The vitals tests cover retained snapshots,

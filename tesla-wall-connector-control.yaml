@@ -1,36 +1,15 @@
 # ==============================================================================
 # Tesla Wall Connector Gen 3 - FW 26.x feedback control (experimental)
 # ==============================================================================
-# ⚠️ REQUIRED USER CONFIGURATION (charger address and Home Assistant entities)
-# ------------------------------------------------------------------------------
-# Set wallconn_ip below to your Wall Connector's local IP address.
-# You MUST set Home Assistant sensor entity_ids for the number of phases
-# you have selected under "Grid Phase Count" when using Auto or Manual.
-# Manual Fixed does not require house-current sensors or load balancing.
-#
-# These sensors MUST report CURRENT PER PHASE IN AMPERES (A),
-# measured on the service incomer INCLUDING the Wall Connector.
-# Signed export / solar-surplus control is not supported by this variant.
-#
-# Examples:
-#   sensor.p1_l1_current
-#   sensor.energy_meter_ct1_amps
-#   sensor.house_phase1_current
-#
-# ❌ Do NOT use power (W / kW)
-# ❌ Do NOT use energy (kWh)
-# ❌ Do NOT use total house current (must be per-phase)
-#
-# Phase requirements (Auto and Manual only):
-#   - 1 phase: only Phase 1 sensor is required
-#   - 2 phases: Phase 1 + Phase 2 sensors are required
-#   - 3 phases: Phase 1 + Phase 2 + Phase 3 sensors are required
-#
-# ------------------------------------------------------------------------------
-# House load sensors (per phase, in AMPERES):
-#   - Phase 1: sensor.your_phase1_current   (required for Auto/Manual)
-#   - Phase 2: sensor.your_phase2_current   (required for 2- and 3-phase)
-#   - Phase 3: sensor.your_phase3_current   (required for 3-phase)
+# REQUIRED USER CONFIGURATION
+# Set wallconn_ip to the local charger IP and preserve your own secrets.
+# Auto/Manual: select "Current Only" for nonnegative import-only phase amps,
+# or "Signed Power + Current" for a grid meter including EV and solar.
+# Solar Surplus requires "Signed Power + Current": per-phase signed W
+# (positive import / negative export), RMS A, and phase-neutral V.
+# Verify meter direction and phase order before use. Never use kWh or totals.
+# Configure every active phase selected by "Grid Phase Count".
+# Manual Fixed and Unregulated do not require household/grid measurements.
 # ==============================================================================
 
 substitutions:
@@ -49,6 +28,15 @@ substitutions:
   house_phase1_entity: sensor.your_phase1_current    # Phase 1 current sensor in Home Assistant (required for Auto/Manual)
   house_phase2_entity: sensor.your_phase2_current    # Phase 2 current sensor (ignored if 1-phase, do not remove)
   house_phase3_entity: sensor.your_phase3_current    # Phase 3 current sensor (ignored if 1- or 2-phase, do not remove)
+
+  # Optional signed grid source; required for Solar Surplus.
+  grid_phase1_power_entity: sensor.your_grid_phase1_real_power
+  grid_phase2_power_entity: sensor.your_grid_phase2_real_power
+  grid_phase3_power_entity: sensor.your_grid_phase3_real_power
+  grid_phase1_voltage_entity: sensor.your_grid_phase1_voltage
+  grid_phase2_voltage_entity: sensor.your_grid_phase2_voltage
+  grid_phase3_voltage_entity: sensor.your_grid_phase3_voltage
+  # house_phase1/2/3_entity above must be the SAME grid meter's RMS currents.
 
 esphome:
   name: ${device_name}
@@ -140,7 +128,7 @@ external_components:
       type: git
       url: https://github.com/Klangen82/tesla-wall-connector-control
       # Pinned component version; update together with this YAML.
-      ref: 8a6392441f6462b0dd100fb0c764c7f83d6bb348
+      ref: 2eb9b857536e942ba48a39400a55d4739d6b3d63
     components: [twc_vitals]
     refresh: never
 
@@ -275,6 +263,9 @@ modbus:
     role: server
 
 globals:
+  - id: grid_received_ms
+    type: std::array<uint32_t, 6>
+    initial_value: '{0, 0, 0, 0, 0, 0}'
   # Flag to mark internal LED updates (prevents feedback loop)
   - id: led_is_internal_g
     type: bool
@@ -354,10 +345,21 @@ select:
     id: control_mode
     name: "Tesla Control Mode"
     icon: "mdi:ev-station"
-    options: ["Auto", "Manual", "Unregulated", "Manual Fixed"]
+    options: ["Auto", "Manual", "Unregulated", "Manual Fixed", "Solar Surplus"]
     initial_option: "Auto"
     restore_value: true
     optimistic: true
+    on_value:
+      - script.execute: calc_registers
+
+  - platform: template
+    id: grid_measurement_source
+    name: "Grid Measurement Source"
+    options: ["Current Only", "Signed Power + Current"]
+    initial_option: "Current Only"
+    restore_value: true
+    optimistic: true
+    entity_category: config
     on_value:
       - script.execute: calc_registers
 
@@ -533,6 +535,34 @@ number:
     on_value:
       - script.execute: calc_registers
 
+  - platform: template
+    id: solar_deficit_delay
+    name: "Solar Deficit Grace Time"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 300
+    step: 5
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    on_value:
+      - script.execute: calc_registers
+
+  - platform: template
+    id: solar_start_delay
+    name: "Solar Start Stable Time"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 300
+    step: 5
+    initial_value: 30
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    on_value:
+      - script.execute: calc_registers
+
 
 button:
   # Restart ESP device from Home Assistant
@@ -574,6 +604,7 @@ sensor:
   # Phase 1 house load (from Home Assistant sensor)
   - platform: template
     name: "House Load Phase 1"
+    update_interval: 2s
     unit_of_measurement: "A"
     accuracy_decimals: 2
     lambda: |-
@@ -582,6 +613,7 @@ sensor:
   # Phase 2 house load (from Home Assistant sensor)
   - platform: template
     name: "House Load Phase 2"
+    update_interval: 2s
     unit_of_measurement: "A"
     accuracy_decimals: 2
     lambda: |-
@@ -590,6 +622,7 @@ sensor:
   # Phase 3 house load (from Home Assistant sensor)
   - platform: template
     name: "House Load Phase 3"
+    update_interval: 2s
     unit_of_measurement: "A"
     accuracy_decimals: 2
     lambda: |-
@@ -624,6 +657,75 @@ sensor:
         - lambda: |-
             twc_control::controller().house[2].update(x, millis(), ${house_sensor_timeout_ms} > 0);
             id(calc_registers).execute();
+
+  - platform: homeassistant
+    id: ha_grid_power_1
+    entity_id: ${grid_phase1_power_entity}
+    on_value:
+      - lambda: id(grid_received_ms)[0] = millis();
+      - script.execute: calc_registers
+
+  - platform: homeassistant
+    id: ha_grid_voltage_1
+    entity_id: ${grid_phase1_voltage_entity}
+    on_value:
+      - lambda: id(grid_received_ms)[1] = millis();
+      - script.execute: calc_registers
+
+  - platform: template
+    name: "Tesla Actual Phase 1 Current"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: |-
+      return id(wallconn_vitals).fresh(${vitals_timeout_ms}) ? id(wallconn_vitals).sample().phase[0] : NAN;
+
+  - platform: homeassistant
+    id: ha_grid_power_2
+    entity_id: ${grid_phase2_power_entity}
+    on_value:
+      - lambda: id(grid_received_ms)[2] = millis();
+      - script.execute: calc_registers
+
+  - platform: homeassistant
+    id: ha_grid_voltage_2
+    entity_id: ${grid_phase2_voltage_entity}
+    on_value:
+      - lambda: id(grid_received_ms)[3] = millis();
+      - script.execute: calc_registers
+
+  - platform: template
+    name: "Tesla Actual Phase 2 Current"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: |-
+      return id(wallconn_vitals).fresh(${vitals_timeout_ms}) ? id(wallconn_vitals).sample().phase[1] : NAN;
+
+  - platform: homeassistant
+    id: ha_grid_power_3
+    entity_id: ${grid_phase3_power_entity}
+    on_value:
+      - lambda: id(grid_received_ms)[4] = millis();
+      - script.execute: calc_registers
+
+  - platform: homeassistant
+    id: ha_grid_voltage_3
+    entity_id: ${grid_phase3_voltage_entity}
+    on_value:
+      - lambda: id(grid_received_ms)[5] = millis();
+      - script.execute: calc_registers
+
+  - platform: template
+    name: "Tesla Actual Phase 3 Current"
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: |-
+      return id(wallconn_vitals).fresh(${vitals_timeout_ms}) ? id(wallconn_vitals).sample().phase[2] : NAN;
 
   # Exposes Wall Connector max current as sensor for UI visibility
   - platform: template
@@ -748,6 +850,12 @@ sensor:
 
 binary_sensor:
   - platform: template
+    name: "Tesla Contactor Closed"
+    entity_category: diagnostic
+    lambda: |-
+      return id(wallconn_vitals).fresh(${vitals_timeout_ms}) && id(wallconn_vitals).sample().contactor;
+
+  - platform: template
     name: "Tesla Feedback Healthy"
     lambda: return id(wallconn_vitals).fresh(${vitals_timeout_ms});
 
@@ -757,6 +865,12 @@ binary_sensor:
     lambda: return id(modbus_last_poll_ms) != 0 && uint32_t(millis() - id(modbus_last_poll_ms)) < 10000;
 
 text_sensor:
+  - platform: template
+    name: "Tesla Feedback Last Failure"
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: return std::string(id(wallconn_vitals).last_failure_status());
+
   - platform: homeassistant
     id: ha_meter_reporting
     entity_id: ${house_meter_reporting_entity}
@@ -792,7 +906,8 @@ text_sensor:
       int phases = atoi(id(ha_phase_count).current_option().c_str());
       if (!id(ha_api).is_connected_with_state_subscription())
         return std::string("HA disconnected");
-      if (!twc_control::controller().house_available(phases, millis(), ${house_sensor_timeout_ms}))
+      if (id(grid_measurement_source).current_option() != "Signed Power + Current"
+          && !twc_control::controller().house_available(phases, millis(), ${house_sensor_timeout_ms}))
         return std::string("Required house sensor missing, invalid or stale");
       if (id(house_meter_guard).state) {
         if (id(ha_meter_reporting).state != "on" || !id(house_reporting_seen)
@@ -800,6 +915,8 @@ text_sensor:
           return std::string("House meter reporting missing or stale");
         return std::string("House sensors available; reporting guard healthy");
       }
+      if (id(grid_measurement_source).current_option() == "Signed Power + Current")
+        return std::string("Signed grid source selected; inspect control/watchdog status for validity");
       return std::string("House sensors available; source reporting guard OFF");
     update_interval: 2s
 
@@ -827,6 +944,11 @@ script:
     then:
       - lambda: |-
           twc_control::Settings settings;
+          settings.signed_grid = id(grid_measurement_source).current_option() == "Signed Power + Current";
+          settings.solar_deficit_ms = std::isfinite(id(solar_deficit_delay).state)
+              ? uint32_t(id(solar_deficit_delay).state * 1000.0f) : 60000u;
+          settings.solar_start_ms = std::isfinite(id(solar_start_delay).state)
+              ? uint32_t(id(solar_start_delay).state * 1000.0f) : 30000u;
           settings.main_fuse = id(ha_main_fuse).state;
           settings.conductor = id(ha_conductor_limit).state;
           settings.max_charge = id(ha_wc_max_current).state;
@@ -845,6 +967,7 @@ script:
           auto mode = id(control_mode).current_option();
           input.mode = mode == "Unregulated" ? twc_control::Mode::UNREGULATED
               : mode == "Manual Fixed" ? twc_control::Mode::MANUAL_FIXED
+              : mode == "Solar Surplus" ? twc_control::Mode::SOLAR
               : mode == "Manual" ? twc_control::Mode::MANUAL : twc_control::Mode::AUTO;
           auto phase_option = id(ha_phase_count).current_option();
           input.phases = phase_option.empty() ? 3 : atoi(phase_option.c_str());
@@ -858,6 +981,20 @@ script:
           input.contactor = vitals.contactor;
           input.vehicle = vitals.vehicle;
           for (int i = 0; i < 3; ++i) input.ev[i] = vitals.phase[i];
+          input.grid_power[0] = id(ha_grid_power_1).state;
+          input.grid_power[1] = id(ha_grid_power_2).state;
+          input.grid_power[2] = id(ha_grid_power_3).state;
+          input.grid_voltage[0] = id(ha_grid_voltage_1).state;
+          input.grid_voltage[1] = id(ha_grid_voltage_2).state;
+          input.grid_voltage[2] = id(ha_grid_voltage_3).state;
+          input.grid_current[0] = id(ha_house_l1).state;
+          input.grid_current[1] = id(ha_house_l2).state;
+          input.grid_current[2] = id(ha_house_l3).state;
+          if (settings.signed_grid && settings.house_timeout_ms > 0) {
+            input.grid_fresh = twc_control::controller().house_available(input.phases, input.now, settings.house_timeout_ms);
+            for (int i = 0; i < input.phases * 2; ++i)
+              input.grid_fresh = input.grid_fresh && uint32_t(input.now - id(grid_received_ms)[i]) < settings.house_timeout_ms;
+          }
           const auto result = twc_control::controller().tick(settings, input);
           id(target_current_internal_a) = result.target;
           id(current_headroom_a) = result.headroom;
@@ -866,7 +1003,8 @@ script:
               || result.zone == twc_control::Zone::BOOT || result.zone == twc_control::Zone::RESTART_WAIT;
           id(watchdog_reason) = result.fault != twc_control::Fault::NONE
               ? twc_control::fault_name(result.fault) : "Below minimum charge current";
-          id(control_status) = std::string(mode.empty() ? "Auto" : mode.c_str()) + " / " + twc_control::zone_name(result.zone);
+          id(control_status) = std::string(mode.empty() ? "Auto" : mode.c_str()) + " / " + twc_control::zone_name(result.zone)
+              + (result.solar_grace ? " / Solar deficit grace (grid import allowed)" : "");
           id(ct1_current_a) = result.reported[0];
           id(ct2_current_a) = result.reported[1];
           id(ct3_current_a) = result.reported[2];

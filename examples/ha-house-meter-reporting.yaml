@@ -1,6 +1,8 @@
 # HOME ASSISTANT configuration, not an ESPHome device configuration.
 # Merge this template entry into HA configuration.yaml (or a HA package).
-# Used by Auto and load-balanced Manual; ignored by Manual Fixed/Unregulated.
+# Used by Auto, load-balanced Manual and Solar Surplus; ignored by Manual Fixed/Unregulated.
+# For Signed Power + Current, add all active-phase real-power and voltage
+# entity IDs to the entities list too; freshness of amps alone is insufficient.
 # Adapt the entity list to the selected grid phases; 1 phase needs only L1.
 # Verify last_reported advances on REAL meter reports even at constant current.
 # For MQTT sources, force_update may be needed; cached/replayed reports do not
