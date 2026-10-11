@@ -56,6 +56,8 @@ void TWCVitals::loop() {
       consecutive_failures_ = 0;
       status_clear_warning();
     } else {
+      failed_ = true;
+      last_failure_ = result.error;
       failure_count_++;
       consecutive_failures_++;
       if (changed || consecutive_failures_ == 1 || consecutive_failures_ % 30 == 0)

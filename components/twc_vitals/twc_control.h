@@ -1,13 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 
 // Experimental FW 26.x controller. Community references and hardware test
 // procedure are in README.md. This is a control request, not a Tesla safety API.
 namespace twc_control {
-enum class Mode { AUTO, MANUAL, MANUAL_FIXED, UNREGULATED };
+enum class Mode { AUTO, MANUAL, MANUAL_FIXED, UNREGULATED, SOLAR };
 enum class Zone { BOOT, PAUSE, RESTART_WAIT, START, INCREASE, HOLD, REDUCE, HARD, UNREGULATED };
 enum class Fault { NONE, BOOT, CONFIG, HA, HOUSE, METER, VITALS };
 
@@ -67,6 +68,9 @@ struct Phase {
 };
 
 struct Settings {
+  bool signed_grid = false;
+  uint32_t solar_deficit_ms = 60000;
+  uint32_t solar_start_ms = 30000;
   float main_fuse = 16;
   float conductor = 16;
   float max_charge = 32;
@@ -96,6 +100,11 @@ struct Input {
   bool contactor = false;
   float ev[3] = {0, 0, 0};
   float vehicle = 0;
+  // Signed active power (positive import), RMS current and phase-neutral volts.
+  float grid_power[3] = {NAN, NAN, NAN};
+  float grid_current[3] = {NAN, NAN, NAN};
+  float grid_voltage[3] = {NAN, NAN, NAN};
+  bool grid_fresh = true;
   uint32_t now = 0;
 };
 
@@ -106,6 +115,7 @@ struct Output {
   Zone zone = Zone::PAUSE;
   Fault fault = Fault::NONE;
   bool watchdog_active = false;
+  bool solar_grace = false;
 };
 
 class Controller {
@@ -132,12 +142,15 @@ class Controller {
       for (int i = 0; i < 3; ++i)
         out.reported[i] = i < phases ? std::max(0.0f, value + dither) : 0.0f;
     };
-    if (in.mode != mode_ || phases != phases_) {
+    if (in.mode != mode_ || phases != phases_ || s.signed_grid != signed_grid_) {
       mode_ = in.mode;
       phases_ = phases;
+      signed_grid_ = s.signed_grid;
       reset_regulation_();
       fault_pending_ = recovering_ = watchdog_active_ = false;
       low_budget_paused_ = resume_pending_ = false;
+      solar_deficit_pending_ = solar_start_pending_ = solar_running_ = false;
+      for (auto &g : grid_estimate_) g.valid = false;
     }
     if (limit != previous_limit_) {
       reset_regulation_();
@@ -161,9 +174,11 @@ class Controller {
       return out;
     }
     const bool load_balanced = in.mode != Mode::MANUAL_FIXED;
-    if (!valid_settings_(s, load_balanced)) out.fault = Fault::CONFIG;
+    const bool solar = in.mode == Mode::SOLAR;
+    if (!valid_settings_(s, load_balanced) || (solar && !s.signed_grid)) out.fault = Fault::CONFIG;
     else if (load_balanced && !in.ha_connected) out.fault = Fault::HA;
-    else if (load_balanced && !house_available(phases, in.now, s.house_timeout_ms)) out.fault = Fault::HOUSE;
+    else if (load_balanced && (s.signed_grid ? (!in.grid_fresh || !valid_grid_(in, phases))
+        : !house_available(phases, in.now, s.house_timeout_ms))) out.fault = Fault::HOUSE;
     else if (load_balanced && s.meter_guard && !in.meter_reporting) out.fault = Fault::METER;
     else if (!valid_feedback_(in, phases)) out.fault = Fault::VITALS;
 
@@ -171,6 +186,7 @@ class Controller {
       reset_regulation_();
       recovering_ = false;
       resume_pending_ = false;
+      solar_deficit_pending_ = solar_start_pending_ = solar_running_ = false;
       if (!fault_pending_) { fault_pending_ = true; fault_since_ = in.now; }
       if (s.watchdog && uint32_t(in.now - fault_since_) >= s.fault_delay_ms)
         watchdog_active_ = true;
@@ -193,6 +209,7 @@ class Controller {
     float actual = in.contactor ? in.vehicle : 0.0f;
     float headroom = load_balanced ? s.main_fuse - s.margin : s.max_charge;
     float worst_total = 0;
+    float surplus = s.max_charge;
     bool all_phases = true;
     for (int i = 0; i < phases; ++i) {
       const float ev = in.contactor ? in.ev[i] : 0.0f;
@@ -201,22 +218,77 @@ class Controller {
       // Meter includes the car. Do not subtract the entire incomer reading
       // from available CHARGER current or add the car twice to the meter.
       if (load_balanced) {
-        const float total = std::max(house[i].trusted, ev);
-        const float other = std::max(0.0f, total - ev);
-        headroom = std::min(headroom, s.main_fuse - s.margin - other);
-        worst_total = std::max(worst_total, total);
+        if (s.signed_grid) {
+          const float active = in.grid_power[i] / in.grid_voltage[i];
+          const float rms = in.grid_current[i];
+          const float nonactive_sq = std::max(0.0f, rms * rms - active * active);
+          auto &g = grid_estimate_[i];
+          if (!g.valid || g.power != in.grid_power[i]) {
+            g.valid = true;
+            g.power = in.grid_power[i];
+            g.other_active = active - ev;
+          }
+          // Do not subtract a new EV sample repeatedly from an unchanged grid
+          // reading. This prevents our own ramp/down-ramp moving the budget
+          // without a new meter value. Arrival alignment is still approximate.
+          const float other_active = g.other_active;
+          const float fuse = s.main_fuse - s.margin;
+          // A unity-power-factor EV adds active current. Keep the measured
+          // non-active component rather than treating P/V as RMS current.
+          const float capacity = nonactive_sq > fuse * fuse ? 0.0f
+              : std::max(0.0f, std::sqrt(fuse * fuse - nonactive_sq) - other_active);
+          headroom = std::min(headroom, capacity);
+          worst_total = std::max(worst_total, rms);
+          surplus = std::min(surplus, -other_active);
+        } else {
+          const float total = std::max(house[i].trusted, ev);
+          const float other = std::max(0.0f, total - ev);
+          headroom = std::min(headroom, s.main_fuse - s.margin - other);
+          worst_total = std::max(worst_total, total);
+        }
       }
     }
     out.headroom = load_balanced ? std::max(0.0f, headroom) : NAN;
     const float allowed = std::max(0.0f, std::min(s.max_charge, headroom));
-    float desired = in.mode == Mode::AUTO ? allowed : std::min(s.manual_target, allowed);
+    float desired = solar ? std::max(0.0f, std::min(surplus, allowed))
+        : in.mode == Mode::AUTO ? allowed : std::min(s.manual_target, allowed);
+    if (solar) {
+      // Only an already charging session gets cloud grace. Electrical/data
+      // guards always win, and expired grace cannot rearm until stable restart.
+      const bool drawing = in.contactor && actual >= 2.0f;
+      if (solar_running_ && drawing && desired < s.minimum && allowed >= s.minimum
+          && worst_total <= s.main_fuse - s.margin + 0.1f && !watchdog_active_) {
+        if (!solar_deficit_pending_) { solar_deficit_pending_ = true; solar_deficit_since_ = in.now; }
+        if (uint32_t(in.now - solar_deficit_since_) < s.solar_deficit_ms) {
+          desired = s.minimum;
+          out.solar_grace = true;
+        }
+      } else if (desired >= s.minimum) {
+        solar_deficit_pending_ = false;
+      }
+      if (!out.solar_grace && desired < s.minimum) {
+        solar_running_ = solar_start_pending_ = false;
+      }
+      if (!solar_running_ && desired >= s.minimum) {
+        if (surplus < s.minimum + s.resume_margin) solar_start_pending_ = false;
+        else if (!solar_start_pending_) { solar_start_pending_ = true; solar_start_since_ = in.now; }
+        if (!solar_start_pending_ || uint32_t(in.now - solar_start_since_) < s.solar_start_ms) {
+          out.zone = Zone::RESTART_WAIT;
+          reset_regulation_();
+          publish(limit + 1.2f);
+          return out;
+        }
+        solar_running_ = true;
+        solar_deficit_pending_ = false;
+      }
+    }
     if (watchdog_active_) desired = std::min(desired, s.fallback);
     out.target = std::max(0.0f, std::floor(desired));
     if (out.target < s.minimum) {
       out.target = 0;
       out.zone = Zone::PAUSE;
       reset_regulation_();
-      low_budget_paused_ = load_balanced;
+      low_budget_paused_ = load_balanced && !solar;
       resume_pending_ = false;
       publish(limit + 1.2f);
       return out;
@@ -292,6 +364,20 @@ class Controller {
   }
 
  private:
+  struct GridEstimate {
+    bool valid = false;
+    float power = NAN, other_active = NAN;
+  };
+  GridEstimate grid_estimate_[3];
+  static bool valid_grid_(const Input &in, int phases) {
+    for (int i = 0; i < phases; ++i) {
+      const float w = in.grid_power[i], a = in.grid_current[i], v = in.grid_voltage[i];
+      if (!std::isfinite(w) || !std::isfinite(a) || !std::isfinite(v)
+          || v < 80 || v > 300 || a < 0 || a > 200
+          || std::fabs(w) / v > a + 0.5f) return false;
+    }
+    return true;
+  }
   static bool valid_settings_(const Settings &s, bool load_balanced) {
     return (!load_balanced || (std::isfinite(s.main_fuse) && s.main_fuse >= 6 && s.main_fuse <= 200 &&
         std::isfinite(s.margin) && s.margin >= 0 && s.margin < s.main_fuse &&
@@ -312,6 +398,12 @@ class Controller {
   }
   void reset_regulation_() { charging_ = over_pending_ = published_ = false; }
   Mode mode_ = Mode::AUTO;
+  bool signed_grid_ = false;
+  bool solar_running_ = false;
+  bool solar_start_pending_ = false;
+  uint32_t solar_start_since_ = 0;
+  bool solar_deficit_pending_ = false;
+  uint32_t solar_deficit_since_ = 0;
   int phases_ = 3;
   bool charging_ = false;
   uint32_t charging_since_ = 0;

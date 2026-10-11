@@ -51,6 +51,7 @@ class TWCVitals : public PollingComponent {
   float response_time_ms() const { return received_ ? float(last_request_.duration_ms) : NAN; }
   int http_status() const { return last_request_.http_status; }
   float last_success_age_s() const { return successful_ ? float(uint32_t(millis() - last_success_ms_)) / 1000.0f : NAN; }
+  const char *last_failure_status() const { return failed_ ? request_error_name(last_failure_) : "No failed polls since boot"; }
   uint32_t failure_count() const { return failure_count_; }
   uint32_t consecutive_failures() const { return consecutive_failures_; }
 
@@ -66,6 +67,8 @@ class TWCVitals : public PollingComponent {
   bool received_ = false;
   bool successful_ = false;
   uint32_t last_success_ms_ = 0;
+  bool failed_ = false;
+  RequestError last_failure_ = RequestError::NONE;
   uint32_t failure_count_ = 0;
   uint32_t consecutive_failures_ = 0;
 };

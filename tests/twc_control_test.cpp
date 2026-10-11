@@ -344,5 +344,137 @@ int main() {
     r.in.ev[2] = NAN;
     assert(r.tick().fault == Fault::VITALS);
   }
+  {
+    Rig r;
+    r.s.signed_grid = true;
+    r.in.mode = Mode::SOLAR;
+    r.in.contactor = false;
+    r.in.vehicle = 0;
+    for (int i = 0; i < 3; ++i) {
+      r.in.ev[i] = 0;
+      r.in.grid_voltage[i] = 230;
+      r.in.grid_power[i] = -8 * 230;
+      r.in.grid_current[i] = 8;
+    }
+    r.s.resume_margin = 1;
+    assert(r.tick(0).zone == Zone::RESTART_WAIT);
+    assert(r.tick(29999).target == 0);
+    assert(r.tick(30000).target == 8);
+    r.in.contactor = true;
+    r.in.vehicle = 8;
+    for (int i = 0; i < 3; ++i) r.in.ev[i] = 8;
+    assert(r.tick(31000).target == 8); // Unchanged grid values cannot chase the EV ramp.
+    r.in.grid_voltage[0] = 231;
+    assert(r.tick(31100).target == 8); // Voltage-only reports must not re-pair old real power.
+    r.in.grid_voltage[0] = 230;
+    for (int i = 0; i < 3; ++i) {
+      r.in.grid_power[i] = 4 * 230; // Other load is -4 A, so only 4 A surplus.
+      r.in.grid_current[i] = 4;
+    }
+    auto o = r.tick(32000);
+    assert(o.target == 6 && o.solar_grace);
+    assert(r.tick(91999).solar_grace);
+    o = r.tick(92000);
+    assert(o.target == 0 && !o.solar_grace);
+    // Continued current/feedback must not rearm grace after its deadline.
+    assert(r.tick(93000).target == 0);
+    r.in.contactor = false;
+    r.in.vehicle = 0;
+    for (int i = 0; i < 3; ++i) {
+      r.in.ev[i] = 0;
+      r.in.grid_power[i] = -8 * 230;
+      r.in.grid_current[i] = 8;
+    }
+    assert(r.tick(94000).target == 0);
+    assert(r.tick(124000).target == 8);
+    r.in.grid_power[1] = NAN;
+    assert(r.tick(125000).fault == Fault::HOUSE);
+  }
+  {
+    Rig r;
+    r.s.signed_grid = true;
+    r.in.contactor = false;
+    r.in.vehicle = 0;
+    for (int i = 0; i < 3; ++i) {
+      r.in.ev[i] = 0;
+      r.in.grid_voltage[i] = 230;
+      r.in.grid_power[i] = -3 * 230;
+      r.in.grid_current[i] = 3;
+    }
+    assert(r.tick().target == 16); // Export adds headroom rather than consuming it.
+    r.in.grid_power[2] = 4 * 230;
+    r.in.grid_current[2] = 4;
+    assert(r.tick().target == 15); // Worst phase still determines fuse capacity.
+    r.in.grid_power[2] = 0;
+    r.in.grid_current[2] = 18;
+    assert(r.tick().target == 6); // P/V alone would miss non-active current.
+    r.in.grid_current[2] = 21;
+    assert(r.tick().target == 0); // No grace can override insufficient RMS capacity.
+    r.in.grid_current[2] = 0;
+    r.in.grid_fresh = false;
+    assert(r.tick().fault == Fault::HOUSE);
+    r.in.grid_fresh = true;
+    r.in.grid_voltage[0] = 0;
+    assert(r.tick().fault == Fault::HOUSE);
+    r.in.grid_voltage[0] = 230;
+    r.s.signed_grid = false;
+    r.in.mode = Mode::SOLAR;
+    assert(r.tick().fault == Fault::CONFIG); // Solar cannot use unsigned import-only amps.
+  }
+  {
+    Rig r;
+    r.s.signed_grid = true;
+    r.s.solar_start_ms = 0;
+    r.s.solar_deficit_ms = 60000;
+    r.in.mode = Mode::SOLAR;
+    for (int i = 0; i < 3; ++i) {
+      r.in.grid_voltage[i] = 230;
+      r.in.grid_power[i] = 2 * 230; // EV 10 A, other active current -8 A.
+      r.in.grid_current[i] = 2;
+    }
+    assert(r.tick().target == 8);
+    r.in.grid_power[0] = 21 * 230;
+    r.in.grid_current[0] = 21;
+    auto o = r.tick(1000);
+    assert(!o.solar_grace && o.target == 0 && o.reported[0] > r.s.conductor + 1.1f);
+    r.in.feedback_fresh = false;
+    assert(r.tick(2000).fault == Fault::VITALS);
+  }
+  {
+    // A short solar recovery resets only the deficit timer; phase limits and
+    // data validity apply independently, including at the millis rollover.
+    Rig r;
+    r.s.signed_grid = true;
+    r.s.solar_start_ms = 0;
+    r.s.solar_deficit_ms = 1000;
+    r.in.mode = Mode::SOLAR;
+    for (int i = 0; i < 3; ++i) {
+      r.in.grid_voltage[i] = 230;
+      r.in.grid_power[i] = 2 * 230;
+      r.in.grid_current[i] = 2;
+    }
+    assert(r.tick(UINT32_MAX - 1000).target == 8);
+    r.in.grid_power[0] = 6 * 230;
+    r.in.grid_current[0] = 6;
+    assert(r.tick(UINT32_MAX - 500).solar_grace);
+    assert(r.tick(498).solar_grace);
+    assert(r.tick(499).target == 0);
+    r.in.grid_power[0] = 2 * 230;
+    r.in.grid_current[0] = 2;
+    assert(r.tick(500).target == 8);
+    r.s.solar_deficit_ms = 0;
+    r.in.grid_power[0] = 6 * 230;
+    r.in.grid_current[0] = 6;
+    assert(r.tick(501).target == 0);
+    for (int phases = 1; phases <= 3; ++phases) {
+      r.in.phases = phases;
+      r.in.grid_power[0] = 2 * 230;
+      r.in.grid_current[0] = 2;
+      assert(r.tick(1000 + phases).target == 8);
+      r.in.grid_voltage[phases - 1] = NAN;
+      assert(r.tick(2000 + phases).fault == Fault::HOUSE);
+      r.in.grid_voltage[phases - 1] = 230;
+    }
+  }
   std::cout << "All TWC control scenarios passed\n";
 }

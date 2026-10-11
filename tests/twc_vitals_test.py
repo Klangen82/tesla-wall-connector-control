@@ -81,10 +81,12 @@ int main() {
  Sample failure; failure.error=RequestError::TRANSPORT; failure.captured_ms=1000;
  test_now=1000; v.deliver(failure);
  assert(!v.fresh(8000)); assert(std::isnan(v.last_success_age_s()));
+ assert(std::strcmp(v.last_failure_status(), "HTTP transport error") == 0);
  Sample good; good.valid=true; good.error=RequestError::NONE;
  good.captured_ms=2000; good.http_status=200; good.vehicle=10;
  good.phase[0]=10; good.phase[1]=9; good.phase[2]=8; good.contactor=true;
  test_now=2000; v.deliver(good);
+ assert(std::strcmp(v.last_failure_status(), "HTTP transport error") == 0);
  assert(v.fresh(8000)); assert(v.consecutive_failures()==0);
  failure.duration_ms=2400; failure.http_status=-1;
  for (auto error : {RequestError::TRANSPORT, RequestError::TIMEOUT,
